@@ -59,6 +59,8 @@ MAX_TOKENS = int(_optional("MAX_TOKENS", "8192"))
 # ── Email (required) ───────────────────────────────────────────────────────
 GMAIL_SENDER    = _require("GMAIL_SENDER")
 GMAIL_APP_PASS  = _require("GMAIL_APP_PASS")
+# Supports multiple recipients — separate with commas:
+# e.g. "a@gmail.com,b@gmail.com"
 RECIPIENT_EMAIL = _require("RECIPIENT_EMAIL")
 
 # ── Batch API settings ─────────────────────────────────────────────────────
@@ -114,5 +116,6 @@ Rules:
 - Use null (not "N/A", not "") for any field not present in the document
 - Do NOT calculate any values — extract exactly as printed
 - For TDS challans or payment receipts treat the full payment as one line item
+- Do NOT deduplicate — extract every line item from every page
 - s must be a plain integer starting from 1
 """

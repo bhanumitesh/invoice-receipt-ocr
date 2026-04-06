@@ -374,9 +374,14 @@ Missing fields are left blank.
 Invoice Processor MVP
 """
 
+    # Support multiple recipients — RECIPIENT_EMAIL can be a comma-separated list
+    # e.g. "a@gmail.com,b@gmail.com"
+    # Gmail's sendmail() requires a Python list, not a single comma-joined string.
+    recipients = [r.strip() for r in config.RECIPIENT_EMAIL.split(",") if r.strip()]
+
     msg            = MIMEMultipart()
     msg["From"]    = config.GMAIL_SENDER
-    msg["To"]      = config.RECIPIENT_EMAIL
+    msg["To"]      = ", ".join(recipients)   # display header — comma-separated is fine here
     msg["Subject"] = subject
     msg.attach(MIMEText(body, "plain"))
 
@@ -391,7 +396,7 @@ Invoice Processor MVP
             server.login(config.GMAIL_SENDER, config.GMAIL_APP_PASS)
             server.sendmail(
                 config.GMAIL_SENDER,
-                config.RECIPIENT_EMAIL,
+                recipients,          # list — Gmail sends to each address individually
                 msg.as_string(),
             )
         return True, filename
