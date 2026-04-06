@@ -3,9 +3,20 @@
 #  Run with:  streamlit run app.py
 # ─────────────────────────────────────────────
 
+import os
 import time
 
 import streamlit as st
+
+# ── Load .env file for local development ──────────────────────────────────
+# On the server, environment variables are set directly.
+# Locally, create a .env file in the same directory with your keys.
+# Install with: pip install python-dotenv
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # python-dotenv not installed — using system env vars directly
 
 import config
 from batch_processor import (
