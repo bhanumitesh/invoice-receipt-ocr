@@ -3,16 +3,14 @@
 #  Used by realtime_processor.py and batch_processor.py
 # ─────────────────────────────────────────────
 
+import base64
 import hashlib
 import io
 import json
-import smtplib
 import traceback
 from datetime import datetime
-from email import encoders
-from email.mime.base import MIMEBase
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
+
+import resend
 
 import pdfplumber
 from openpyxl import Workbook
@@ -332,73 +330,73 @@ def send_email(
     mode:           str,
     file_count:     int,
     item_count:     int,
-    dup_warnings:   list  = None,
-    realtime_cost:  dict  = None,
-    batch_id:       str   = None,
+    dup_warnings:   list = None,
+    realtime_cost:  dict = None,
+    batch_id:       str  = None,
 ) -> tuple:
     """
-    Sends the Excel file as an email attachment via Gmail SMTP.
+    Sends the Excel file as an email attachment via Resend API.
+    Uses HTTPS (port 443) — works on all hosting platforms including Render free tier.
     Returns (success: bool, message: str)
     """
+    resend.api_key = config.RESEND_API_KEY
+
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
     filename  = f"Invoice_Register_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-    subject   = f"Invoice Register Ready – {file_count} file(s) | {timestamp}"
+    subject   = f"Invoice Register Ready - {file_count} file(s) | {timestamp}"
 
     dup_section = ""
     if dup_warnings:
         dup_section = (
-            f"\n── Duplicate Invoice Warnings ──────────────\n"
-            + "\n".join(f"  • {w}" for w in dup_warnings)
+            "\n-- Duplicate Invoice Warnings --\n"
+            + "\n".join(f"  * {w}" for w in dup_warnings)
             + "\n"
         )
 
-    body = f"""Hi,
+    body = (
+        f"Hi,\n\n"
+        f"Your invoice extraction is complete.\n\n"
+        f"-- Summary --\n"
+        f"Files processed      : {file_count}\n"
+        f"Line items extracted : {item_count}\n"
+        f"Processed at         : {timestamp}\n"
+        + (f"Batch ID             : {batch_id}\n" if batch_id else "")
+        + f"\n-- Cost --\n"
+        f"{format_cost_summary(cost, mode, realtime_cost)}\n"
+        + dup_section
+        + f"\n-- Note --\n"
+        f"The Excel file is attached.\n"
+        f"All values are extracted directly from source documents.\n"
+        f"Missing fields are left blank.\n"
+        + (f"See 'Duplicate Warnings' sheet in Excel for skipped invoices.\n" if dup_warnings else "")
+        + "\nInvoice Processor MVP\n"
+    )
 
-Your invoice extraction is complete.
-
-── Summary ──────────────────────────────────
-Files processed      : {file_count}
-Line items extracted : {item_count}
-Processed at         : {timestamp}
-{f"Batch ID             : {batch_id}" if batch_id else ""}
-── Cost ─────────────────────────────────────
-{format_cost_summary(cost, mode, realtime_cost)}
-{dup_section}
-── Note ─────────────────────────────────────
-The Excel file is attached.
-All values are extracted directly from source documents.
-Missing fields are left blank.
-{f"See 'Duplicate Warnings' sheet in Excel for skipped invoices." if dup_warnings else ""}
-
-────────────────────────────────────────────
-Invoice Processor MVP
-"""
-
-    # Support multiple recipients — RECIPIENT_EMAIL can be a comma-separated list
+    # Support multiple recipients — RECIPIENT_EMAIL can be comma-separated
     # e.g. "a@gmail.com,b@gmail.com"
-    # Gmail's sendmail() requires a Python list, not a single comma-joined string.
     recipients = [r.strip() for r in config.RECIPIENT_EMAIL.split(",") if r.strip()]
 
-    msg            = MIMEMultipart()
-    msg["From"]    = config.GMAIL_SENDER
-    msg["To"]      = ", ".join(recipients)   # display header — comma-separated is fine here
-    msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain"))
-
-    part = MIMEBase("application", "octet-stream")
-    part.set_payload(excel_bytes)
-    encoders.encode_base64(part)
-    part.add_header("Content-Disposition", f'attachment; filename="{filename}"')
-    msg.attach(part)
+    # Resend requires attachment as base64 string
+    excel_b64 = base64.b64encode(excel_bytes).decode("utf-8")
 
     try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(config.GMAIL_SENDER, config.GMAIL_APP_PASS)
-            server.sendmail(
-                config.GMAIL_SENDER,
-                recipients,          # list — Gmail sends to each address individually
-                msg.as_string(),
-            )
-        return True, filename
+        params = {
+            "from":        config.RESEND_SENDER,
+            "to":          recipients,
+            "subject":     subject,
+            "text":        body,
+            "attachments": [
+                {
+                    "filename": filename,
+                    "content":  excel_b64,
+                }
+            ],
+        }
+        response = resend.Emails.send(params)
+        # Resend returns {"id": "..."} on success
+        if response and response.get("id"):
+            return True, filename
+        else:
+            return False, f"Resend returned unexpected response: {response}"
     except Exception:
         return False, traceback.format_exc()

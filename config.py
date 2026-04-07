@@ -56,11 +56,16 @@ PRICE_OUTPUT_PER_MTOK = float(_optional("PRICE_OUTPUT_PER_MTOK", "15.00"))
 # ── API output settings ────────────────────────────────────────────────────
 MAX_TOKENS = int(_optional("MAX_TOKENS", "8192"))
 
-# ── Email (required) ───────────────────────────────────────────────────────
-GMAIL_SENDER    = _require("GMAIL_SENDER")
-GMAIL_APP_PASS  = _require("GMAIL_APP_PASS")
-# Supports multiple recipients — separate with commas:
-# e.g. "a@gmail.com,b@gmail.com"
+# ── Email / Resend (required) ──────────────────────────────────────────────
+# Sign up free at resend.com — 3,000 emails/month permanently free
+# RESEND_API_KEY : API key from resend.com dashboard
+# RESEND_SENDER  : verified sender address, e.g. "Invoice Processor <invoices@yourdomain.com>"
+#                  On Resend free tier you can use "onboarding@resend.dev" for testing
+#                  For production, verify your own domain at resend.com/domains
+# RECIPIENT_EMAIL: supports multiple comma-separated addresses
+#                  e.g. "a@gmail.com,b@gmail.com"
+RESEND_API_KEY  = _require("RESEND_API_KEY")
+RESEND_SENDER   = _require("RESEND_SENDER")
 RECIPIENT_EMAIL = _require("RECIPIENT_EMAIL")
 
 # ── Batch API settings ─────────────────────────────────────────────────────
