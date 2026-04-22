@@ -76,12 +76,14 @@ if uploaded_files:
 # ── Mode selection ────────────────────────────────────────────────────────────
 
 st.subheader("Processing Mode")
-mode = st.radio(
-    label   = "Choose how to process your invoices:",
-    options = ["⚡ Real-time API", "📦 Batch API (50% cheaper — results by email)"],
-    index   = 0,
-)
-is_batch = mode.startswith("📦")
+# mode = st.radio(
+#     label   = "Choose how to process your invoices:",
+#     options = ["⚡ Real-time API", "📦 Batch API (50% cheaper — results by email)"],
+#     index   = 0,
+# )
+# is_batch = mode.startswith("📦")
+mode = "📦 Batch API"
+is_batch = True
 
 if is_batch:
     st.info(
@@ -90,8 +92,8 @@ if is_batch:
         f"✅ You can safely close this tab — the job continues running.",
         icon="ℹ️",
     )
-else:
-    st.info("⚡ Results appear on this page immediately.", icon="ℹ️")
+# else:
+#     st.info("⚡ Results appear on this page immediately.", icon="ℹ️")
 
 st.divider()
 
@@ -143,8 +145,8 @@ if process_btn and not is_batch:
         # ── Fallback notice ──
         if fallbacks:
             st.warning(
-                f"⚠️ The following file(s) are scanned/image-based and were sent as PDF "
-                f"(higher token cost): {', '.join(fallbacks)}"
+                f"⚠️ The following file(s) are scanned/image-based and were sent as PDF: "
+                f"{', '.join(fallbacks)}"
             )
 
         # ── Duplicate warnings ──
@@ -154,16 +156,16 @@ if process_btn and not is_batch:
                     st.warning(w)
 
         # ── Cost ──
-        st.subheader("💰 Processing Cost")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Input tokens",  f"{cost['input_tokens']:,}")
-        c2.metric("Output tokens", f"{cost['output_tokens']:,}")
-        c3.metric("Total cost",    f"${cost['total_cost_usd']:.4f}")
-        st.caption(
-            f"Input: ${cost['input_cost_usd']:.4f}  |  "
-            f"Output: ${cost['output_cost_usd']:.4f}  |  "
-            f"Model: {config.MODEL}"
-        )
+        # st.subheader("💰 Processing Cost")
+        # c1, c2, c3 = st.columns(3)
+        # c1.metric("Input tokens",  f"{cost['input_tokens']:,}")
+        # c2.metric("Output tokens", f"{cost['output_tokens']:,}")
+        # c3.metric("Total cost",    f"${cost['total_cost_usd']:.4f}")
+        # st.caption(
+        #     f"Input: ${cost['input_cost_usd']:.4f}  |  "
+        #     f"Output: ${cost['output_cost_usd']:.4f}  |  "
+        #     f"Model: {config.MODEL}"
+        # )
 
         # ── Data preview ──
         st.subheader("📋 Extracted Data")
@@ -185,7 +187,7 @@ if process_btn and not is_batch:
                 with st.spinner("Sending..."):
                     ok, msg = send_email(
                         excel_bytes  = excel_bytes,
-                        cost         = cost,
+                        cost         = None,
                         mode         = "Real-time API",
                         file_count   = len(uploaded_files),
                         item_count   = len(items),
@@ -283,14 +285,14 @@ if st.session_state["batch_submitted"] and st.session_state["batch_id"]:
             )
 
         # ── Cost ──
-        st.subheader("💰 Cost Summary (Batch — 50% discount applied)")
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Input tokens",  f"{cost.get('input_tokens', 0):,}")
-        c2.metric("Output tokens", f"{cost.get('output_tokens', 0):,}")
-        c3.metric("Batch cost",    f"${cost.get('total_cost_usd', 0):.4f}")
-        if realtime_cost:
-            saving = realtime_cost.get("total_cost_usd", 0) - cost.get("total_cost_usd", 0)
-            c4.metric("Saved", f"${saving:.4f}", delta="-50%")
+        # st.subheader("💰 Cost Summary (Batch — 50% discount applied)")
+        # c1, c2, c3, c4 = st.columns(4)
+        # c1.metric("Input tokens",  f"{cost.get('input_tokens', 0):,}")
+        # c2.metric("Output tokens", f"{cost.get('output_tokens', 0):,}")
+        # c3.metric("Batch cost",    f"${cost.get('total_cost_usd', 0):.4f}")
+        # if realtime_cost:
+        #     saving = realtime_cost.get("total_cost_usd", 0) - cost.get("total_cost_usd", 0)
+        #     c4.metric("Saved", f"${saving:.4f}", delta="-50%")
 
         # ── Data preview ──
         if items:
@@ -336,9 +338,10 @@ if st.session_state["batch_submitted"] and st.session_state["batch_id"]:
 
 # ── Footer ────────────────────────────────────────────────────────────────────
 st.divider()
-st.caption(
-    f"Model: `{config.MODEL}` | "
-    f"Real-time: ${config.PRICE_INPUT_PER_MTOK}/M input, "
-    f"${config.PRICE_OUTPUT_PER_MTOK}/M output | "
-    f"Batch: 50% off"
-)
+# st.caption(
+#     f"Model: `{config.MODEL}` | "
+#     f"Real-time: ${config.PRICE_INPUT_PER_MTOK}/M input, "
+#     f"${config.PRICE_OUTPUT_PER_MTOK}/M output | "
+#     f"Batch: 50% off"
+# )
+st.caption(f"Model: `{config.MODEL}`")

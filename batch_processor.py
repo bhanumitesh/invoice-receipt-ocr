@@ -341,12 +341,12 @@ def retrieve_results(batch_id: str, file_count: int, client=None) -> dict:
         excel_bytes     = create_excel(all_items, dup_warnings or None)
         email_ok, email_result = send_email(
             excel_bytes   = excel_bytes,
-            cost          = batch_cost,
+            cost          = None,
             mode          = "Batch API",
             file_count    = file_count,
             item_count    = len(all_items),
             dup_warnings  = dup_warnings or None,
-            realtime_cost = realtime_cost,
+            realtime_cost = None,
             batch_id      = batch_id,
         )
         write_log(

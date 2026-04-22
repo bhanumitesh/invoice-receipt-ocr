@@ -361,8 +361,8 @@ def send_email(
         f"Line items extracted : {item_count}\n"
         f"Processed at         : {timestamp}\n"
         + (f"Batch ID             : {batch_id}\n" if batch_id else "")
-        + f"\n-- Cost --\n"
-        f"{format_cost_summary(cost, mode, realtime_cost)}\n"
+        # + f"\n-- Cost --\n"
+        # f"{format_cost_summary(cost, mode, realtime_cost)}\n"
         + dup_section
         + f"\n-- Note --\n"
         f"The Excel file is attached.\n"
