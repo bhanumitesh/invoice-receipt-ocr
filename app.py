@@ -39,7 +39,7 @@ st.set_page_config(
 )
 
 st.title("🧾 Invoice Processor")
-st.caption("Extract structured data from invoice PDFs using Claude AI")
+st.caption("Extract structured data from invoice PDFs")
 st.divider()
 
 
