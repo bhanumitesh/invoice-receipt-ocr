@@ -322,20 +322,257 @@ def create_excel(items: list, dup_warnings: list = None) -> bytes:
     return buf.read()
 
 
+
+# ── Tally XML generation ──────────────────────────────────────────────────────
+
+def _parse_amount(val) -> float:
+    """
+    Safely extracts a float from a value that may be a string like "Rs.1,234.56"
+    or "₹1,234.56" or just "1234.56". Returns 0.0 if unparseable.
+    """
+    if val is None or val == "":
+        return 0.0
+    s = str(val)
+    # Remove currency symbols and whitespace
+    for ch in ["₹", "Rs.", "Rs", "$", "€", "£", ",", " "]:
+        s = s.replace(ch, "")
+    s = s.strip()
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
+
+
+def _tally_date(date_str: str) -> str:
+    """
+    Converts various date formats to Tally's required YYYYMMDD format.
+    Tries common Indian invoice date formats.
+    Returns today's date as fallback.
+    """
+    from datetime import date as date_type
+    import re
+
+    if not date_str:
+        return datetime.now().strftime("%Y%m%d")
+
+    s = str(date_str).strip()
+
+    formats = [
+        "%d-%b-%Y",     # 26-Sep-2024
+        "%d/%m/%Y",     # 26/09/2024
+        "%d-%m-%Y",     # 26-09-2024
+        "%Y-%m-%d",     # 2024-09-26
+        "%b %d, %Y",    # Sep 26, 2024
+        "%d %b %Y",     # 26 Sep 2024
+        "%d-%b-%y",     # 26-Sep-24
+        "%m/%d/%Y",     # 09/26/2024
+    ]
+    for fmt in formats:
+        try:
+            return datetime.strptime(s, fmt).strftime("%Y%m%d")
+        except ValueError:
+            continue
+
+    # Last resort — extract 4-digit year and return Jan 1 of that year
+    m = re.search(r"(\d{4})", s)
+    if m:
+        return m.group(1) + "0101"
+    return datetime.now().strftime("%Y%m%d")
+
+
+def _escape_xml(val) -> str:
+    """Escapes special XML characters in a string value."""
+    if val is None:
+        return ""
+    s = str(val)
+    s = s.replace("&",  "&amp;")
+    s = s.replace("<",  "&lt;")
+    s = s.replace(">",  "&gt;")
+    s = s.replace('"',  "&quot;")
+    s = s.replace("'", "&apos;")
+    return s
+
+
+def _build_voucher_xml(item: dict, tally_version: str) -> str:
+    """
+    Builds a single <VOUCHER> XML block for one invoice line item.
+    tally_version: "erp9" or "prime"
+
+    Both use the same core schema — TallyPrime adds GUID and ALTERID
+    attributes which ERP 9 ignores, so we include them in both for safety.
+    """
+    date      = _tally_date(item.get("invoice_date", ""))
+    party     = _escape_xml(item.get("party_name", ""))
+    inv_no    = _escape_xml(item.get("invoice_no",  ""))
+    desc      = _escape_xml(item.get("description", ""))
+    narration = _escape_xml(
+        f"{item.get('description','')} | Invoice: {item.get('invoice_no','')} "
+        f"| GSTIN: {item.get('gstin','') or 'N/A'} "
+        f"| HSN: {item.get('hsn_code','') or 'N/A'}"
+    )
+    ledger    = _escape_xml(config.TALLY_DEFAULT_LEDGER)
+    company   = _escape_xml(config.TALLY_COMPANY_NAME)
+
+    # Amounts
+    total     = _parse_amount(item.get("total_value"))
+    taxable   = _parse_amount(item.get("taxable_value")) or total
+    cgst_amt  = _parse_amount(item.get("cgst"))
+    sgst_amt  = _parse_amount(item.get("sgst"))
+    igst_amt  = _parse_amount(item.get("igst"))
+
+    # Determine GST type
+    has_igst  = igst_amt > 0
+    has_cgst  = cgst_amt > 0
+    has_sgst  = sgst_amt > 0
+
+    # GSTIN for party
+    gstin     = _escape_xml(item.get("gstin") or "")
+
+    # HSN
+    hsn       = _escape_xml(item.get("hsn_code") or "")
+
+    # Build ledger entries
+    # Credit: Party ledger (creditor — we owe them)
+    # Debit:  Expense ledger + GST ledgers
+    entries = []
+
+    # Debit — main expense ledger
+    entries.append(f"""
+        <ALLLEDGERENTRIES.LIST>
+            <LEDGERNAME>{ledger}</LEDGERNAME>
+            <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+            <AMOUNT>-{taxable:.2f}</AMOUNT>
+            <GODOWNENTRIES.LIST/>
+            <CATEGORYENTRIES.LIST/>
+        </ALLLEDGERENTRIES.LIST>""")
+
+    # Debit — GST ledgers
+    if has_igst:
+        entries.append(f"""
+        <ALLLEDGERENTRIES.LIST>
+            <LEDGERNAME>IGST</LEDGERNAME>
+            <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+            <AMOUNT>-{igst_amt:.2f}</AMOUNT>
+            <GODOWNENTRIES.LIST/>
+            <CATEGORYENTRIES.LIST/>
+        </ALLLEDGERENTRIES.LIST>""")
+    if has_cgst:
+        entries.append(f"""
+        <ALLLEDGERENTRIES.LIST>
+            <LEDGERNAME>CGST</LEDGERNAME>
+            <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+            <AMOUNT>-{cgst_amt:.2f}</AMOUNT>
+            <GODOWNENTRIES.LIST/>
+            <CATEGORYENTRIES.LIST/>
+        </ALLLEDGERENTRIES.LIST>""")
+    if has_sgst:
+        entries.append(f"""
+        <ALLLEDGERENTRIES.LIST>
+            <LEDGERNAME>SGST/UTGST</LEDGERNAME>
+            <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+            <AMOUNT>-{sgst_amt:.2f}</AMOUNT>
+            <GODOWNENTRIES.LIST/>
+            <CATEGORYENTRIES.LIST/>
+        </ALLLEDGERENTRIES.LIST>""")
+
+    # Credit — party (sundry creditor)
+    entries.append(f"""
+        <ALLLEDGERENTRIES.LIST>
+            <LEDGERNAME>{party}</LEDGERNAME>
+            <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+            <AMOUNT>{total:.2f}</AMOUNT>
+            <GODOWNENTRIES.LIST/>
+            <CATEGORYENTRIES.LIST/>
+        </ALLLEDGERENTRIES.LIST>""")
+
+    entries_xml = "".join(entries)
+
+    # TallyPrime-specific attributes
+    prime_attrs = ' RESERVEDNAME=""' if tally_version == "prime" else ""
+
+    voucher = f"""
+    <VOUCHER REMOTEID="{inv_no}" VCHTYPE="Purchase" ACTION="Create"{prime_attrs}>
+        <DATE>{date}</DATE>
+        <GUID>{inv_no}-{date}</GUID>
+        <VOUCHERTYPENAME>Purchase</VOUCHERTYPENAME>
+        <VOUCHERNUMBER>{inv_no}</VOUCHERNUMBER>
+        <PARTYLEDGERNAME>{party}</PARTYLEDGERNAME>
+        <NARRATION>{narration}</NARRATION>
+        <BASICBASEPARTYNAME>{party}</BASICBASEPARTYNAME>
+        <PARTYGSTIN>{gstin}</PARTYGSTIN>
+        <PERSISTEDVIEW>Invoice Voucher View</PERSISTEDVIEW>{entries_xml}
+    </VOUCHER>"""
+
+    return voucher
+
+
+def create_tally_xml(items: list, tally_version: str) -> bytes:
+    """
+    Generates a Tally-importable XML file from extracted invoice items.
+
+    tally_version: "erp9"  → Tally ERP 9 format
+                   "prime" → TallyPrime (3.x) format
+
+    Both use the same core ENVELOPE/BODY/IMPORTDATA schema.
+    TallyPrime adds minor attributes ERP 9 safely ignores.
+
+    Returns XML as bytes.
+    """
+    version_comment = (
+        "Tally ERP 9" if tally_version == "erp9"
+        else "TallyPrime 3.x"
+    )
+    company = _escape_xml(config.TALLY_COMPANY_NAME)
+
+    vouchers = "".join(
+        _build_voucher_xml(item, tally_version)
+        for item in items
+        if _parse_amount(item.get("total_value")) > 0
+    )
+
+    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!-- Tally Import File — {version_comment} -->
+<!-- Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")} -->
+<!-- Default ledger: {_escape_xml(config.TALLY_DEFAULT_LEDGER)} -->
+<!-- Reassign ledgers inside Tally after import as needed -->
+<ENVELOPE>
+    <HEADER>
+        <TALLYREQUEST>Import Data</TALLYREQUEST>
+    </HEADER>
+    <BODY>
+        <IMPORTDATA>
+            <REQUESTDESC>
+                <REPORTNAME>Vouchers</REPORTNAME>
+                <STATICVARIABLES>
+                    <SVCURRENTCOMPANY>{company}</SVCURRENTCOMPANY>
+                </STATICVARIABLES>
+            </REQUESTDESC>
+            <REQUESTDATA>{vouchers}
+            </REQUESTDATA>
+        </IMPORTDATA>
+    </BODY>
+</ENVELOPE>"""
+
+    return xml.encode("utf-8")
+
+
+
 # ── Email ─────────────────────────────────────────────────────────────────────
 
 def send_email(
-    excel_bytes:    bytes,
-    cost:           dict,
-    mode:           str,
-    file_count:     int,
-    item_count:     int,
-    dup_warnings:   list = None,
-    realtime_cost:  dict = None,
-    batch_id:       str  = None,
+    excel_bytes:      bytes,
+    cost:             dict,
+    mode:             str,
+    file_count:       int,
+    item_count:       int,
+    dup_warnings:     list  = None,
+    realtime_cost:    dict  = None,
+    batch_id:         str   = None,
+    tally_erp9_bytes: bytes = None,
+    tally_prime_bytes: bytes = None,
 ) -> tuple:
     """
-    Sends the Excel file as an email attachment via Resend API.
+    Sends Excel + both Tally XML files as email attachments via Resend API.
     Uses HTTPS (port 443) — works on all hosting platforms including Render free tier.
     Returns (success: bool, message: str)
     """
@@ -365,8 +602,13 @@ def send_email(
         # f"{format_cost_summary(cost, mode, realtime_cost)}\n"
         + dup_section
         + f"\n-- Note --\n"
-        f"The Excel file is attached.\n"
-        f"All values are extracted directly from source documents.\n"
+        f"Attachments:\n"
+        f"  1. Invoice_Register.xlsx  — full register for review\n"
+        + ("  2. Tally_ERP9_Import.xml   — import into Tally ERP 9\n" if tally_erp9_bytes else "")
+        + ("  3. Tally_Prime_Import.xml  — import into TallyPrime 3.x\n" if tally_prime_bytes else "")
+        + f"\nAll values extracted directly from source documents.\n"
+        f"Default ledger used: {config.TALLY_DEFAULT_LEDGER}\n"
+        f"Reassign ledgers inside Tally after import as needed.\n"
         f"Missing fields are left blank.\n"
         + (f"See 'Duplicate Warnings' sheet in Excel for skipped invoices.\n" if dup_warnings else "")
         + "\nInvoice Processor MVP\n"
@@ -376,8 +618,21 @@ def send_email(
     # e.g. "a@gmail.com,b@gmail.com"
     recipients = [r.strip() for r in config.RECIPIENT_EMAIL.split(",") if r.strip()]
 
-    # Resend requires attachment as base64 string
-    excel_b64 = base64.b64encode(excel_bytes).decode("utf-8")
+    # Resend requires attachments as base64 strings
+    ts          = datetime.now().strftime("%Y%m%d_%H%M%S")
+    excel_b64   = base64.b64encode(excel_bytes).decode("utf-8")
+    attachments = [{"filename": filename, "content": excel_b64}]
+
+    if tally_erp9_bytes:
+        attachments.append({
+            "filename": f"Tally_ERP9_Import_{ts}.xml",
+            "content":  base64.b64encode(tally_erp9_bytes).decode("utf-8"),
+        })
+    if tally_prime_bytes:
+        attachments.append({
+            "filename": f"Tally_Prime_Import_{ts}.xml",
+            "content":  base64.b64encode(tally_prime_bytes).decode("utf-8"),
+        })
 
     try:
         params = {
@@ -385,12 +640,7 @@ def send_email(
             "to":          recipients,
             "subject":     subject,
             "text":        body,
-            "attachments": [
-                {
-                    "filename": filename,
-                    "content":  excel_b64,
-                }
-            ],
+            "attachments": attachments,
         }
         response = resend.Emails.send(params)
         # Resend returns {"id": "..."} on success

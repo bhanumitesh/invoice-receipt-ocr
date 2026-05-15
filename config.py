@@ -68,6 +68,16 @@ RESEND_API_KEY  = _require("RESEND_API_KEY")
 RESEND_SENDER   = _require("RESEND_SENDER")
 RECIPIENT_EMAIL = _require("RECIPIENT_EMAIL")
 
+# ── Tally XML settings ────────────────────────────────────────────────────
+# Default ledger all purchase line items post to.
+# CA reassigns to correct ledgers inside Tally after import.
+# Set this to whatever your CA's standard purchases ledger is named in Tally.
+TALLY_DEFAULT_LEDGER  = _optional("TALLY_DEFAULT_LEDGER",  "Purchase Account")
+
+# Name of your company exactly as it appears in Tally
+# Used in the XML CompanyName field
+TALLY_COMPANY_NAME    = _optional("TALLY_COMPANY_NAME",    "My Company")
+
 # ── Batch API settings ─────────────────────────────────────────────────────
 POLL_INTERVAL_SECONDS = int(_optional("POLL_INTERVAL_SECONDS", "120"))
 

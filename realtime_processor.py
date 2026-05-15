@@ -10,6 +10,7 @@ import anthropic
 import config
 from utils import (
     calculate_cost,
+    create_tally_xml,
     deduplicate_items,
     extract_text_from_pdf,
     parse_json_response,
@@ -124,14 +125,19 @@ def process_realtime(uploaded_files: list) -> dict:
             output_tokens = response.usage.output_tokens,
         )
 
+        tally_erp9_bytes  = create_tally_xml(items, "erp9")
+        tally_prime_bytes = create_tally_xml(items, "prime")
+
         return {
-            "success":          True,
-            "items":            items,
-            "cost":             cost,
-            "dup_warnings":     dup_warnings,
-            "fallback_files":   fallback_files,
-            "extraction_notes": extraction_notes,
-            "error":            None,
+            "success":            True,
+            "items":              items,
+            "cost":               cost,
+            "dup_warnings":       dup_warnings,
+            "fallback_files":     fallback_files,
+            "extraction_notes":   extraction_notes,
+            "error":              None,
+            "tally_erp9_bytes":   tally_erp9_bytes,
+            "tally_prime_bytes":  tally_prime_bytes,
         }
 
     except Exception:

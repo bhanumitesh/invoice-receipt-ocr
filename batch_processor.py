@@ -22,6 +22,7 @@ import config
 from utils import (
     calculate_cost,
     create_excel,
+    create_tally_xml,
     deduplicate_items,
     extract_text_from_pdf,
     parse_json_response,
@@ -337,17 +338,23 @@ def retrieve_results(batch_id: str, file_count: int, client=None) -> dict:
             f"Saved: ${realtime_cost['total_cost_usd'] - batch_cost['total_cost_usd']:.4f}"
         )
 
-        # Create Excel + send email
-        excel_bytes     = create_excel(all_items, dup_warnings or None)
+        # Create Excel + Tally XMLs
+        excel_bytes      = create_excel(all_items, dup_warnings or None)
+        tally_erp9_bytes = create_tally_xml(all_items, "erp9")
+        tally_prime_bytes = create_tally_xml(all_items, "prime")
+        write_log(batch_id, "Excel and Tally XML files created")
+
         email_ok, email_result = send_email(
-            excel_bytes   = excel_bytes,
-            cost          = None,
-            mode          = "Batch API",
-            file_count    = file_count,
-            item_count    = len(all_items),
-            dup_warnings  = dup_warnings or None,
-            realtime_cost = None,
-            batch_id      = batch_id,
+            excel_bytes       = excel_bytes,
+            cost              = batch_cost,
+            mode              = "Batch API",
+            file_count        = file_count,
+            item_count        = len(all_items),
+            dup_warnings      = dup_warnings or None,
+            realtime_cost     = realtime_cost,
+            batch_id          = batch_id,
+            tally_erp9_bytes  = tally_erp9_bytes,
+            tally_prime_bytes = tally_prime_bytes,
         )
         write_log(
             batch_id,
@@ -355,14 +362,16 @@ def retrieve_results(batch_id: str, file_count: int, client=None) -> dict:
         )
 
         return {
-            "success":       True,
-            "items":         all_items,
-            "cost":          batch_cost,
-            "realtime_cost": realtime_cost,
-            "dup_warnings":  dup_warnings,
-            "email_sent":    email_ok,
-            "email_error":   None if email_ok else email_result,
-            "error":         "\n".join(errors) if errors else None,
+            "success":            True,
+            "items":              all_items,
+            "cost":               batch_cost,
+            "realtime_cost":      realtime_cost,
+            "dup_warnings":       dup_warnings,
+            "email_sent":         email_ok,
+            "email_error":        None if email_ok else email_result,
+            "error":              "\n".join(errors) if errors else None,
+            "tally_erp9_bytes":   tally_erp9_bytes,
+            "tally_prime_bytes":  tally_prime_bytes,
         }
 
     except Exception:

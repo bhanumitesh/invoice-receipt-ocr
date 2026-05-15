@@ -5,6 +5,7 @@
 
 import os
 import time
+from datetime import datetime
 
 import streamlit as st
 
@@ -38,8 +39,7 @@ st.set_page_config(
 )
 
 st.title("🧾 Invoice Processor")
-# st.caption("Extract structured data from invoice PDFs using Claude AI")
-st.caption("Extract structured data from invoice PDFs")
+st.caption("Extract structured data from invoice PDFs using Claude AI")
 st.divider()
 
 
@@ -83,6 +83,7 @@ st.subheader("Processing Mode")
 #     index   = 0,
 # )
 # is_batch = mode.startswith("📦")
+
 mode = "📦 Batch API"
 is_batch = True
 
@@ -146,7 +147,7 @@ if process_btn and not is_batch:
         # ── Fallback notice ──
         if fallbacks:
             st.warning(
-                f"⚠️ The following file(s) are scanned/image-based and were sent as PDF: "
+                f"⚠️ The following file(s) are scanned/image-based and were sent as PDF "
                 f"{', '.join(fallbacks)}"
             )
 
@@ -172,14 +173,44 @@ if process_btn and not is_batch:
         st.subheader("📋 Extracted Data")
         st.dataframe(items, use_container_width=True, hide_index=True)
 
-        # ── Download ──
-        excel_bytes = create_excel(items, dup_warnings or None)
-        st.download_button(
-            label               = "⬇️ Download Invoice Register (.xlsx)",
-            data                = excel_bytes,
-            file_name           = f"Invoice_Register_{len(items)}_items.xlsx",
-            mime                = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width = True,
+        # ── Downloads ──
+        st.subheader("📥 Downloads")
+        excel_bytes       = create_excel(items, dup_warnings or None)
+        tally_erp9_bytes  = result.get("tally_erp9_bytes")
+        tally_prime_bytes = result.get("tally_prime_bytes")
+        ts                = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        dl1, dl2, dl3 = st.columns(3)
+        with dl1:
+            st.download_button(
+                label     = "⬇️ Invoice Register (.xlsx)",
+                data      = excel_bytes,
+                file_name = f"Invoice_Register_{len(items)}_items.xlsx",
+                mime      = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width = True,
+            )
+        with dl2:
+            if tally_erp9_bytes:
+                st.download_button(
+                    label     = "⬇️ Tally ERP 9 (.xml)",
+                    data      = tally_erp9_bytes,
+                    file_name = f"Tally_ERP9_{ts}.xml",
+                    mime      = "application/xml",
+                    use_container_width = True,
+                )
+        with dl3:
+            if tally_prime_bytes:
+                st.download_button(
+                    label     = "⬇️ TallyPrime (.xml)",
+                    data      = tally_prime_bytes,
+                    file_name = f"Tally_Prime_{ts}.xml",
+                    mime      = "application/xml",
+                    use_container_width = True,
+                )
+
+        st.caption(
+            f"Tally XML uses default ledger: **{config.TALLY_DEFAULT_LEDGER}** "
+            f"— reassign ledgers inside Tally after import."
         )
 
         # ── Optional email ──
@@ -187,12 +218,14 @@ if process_btn and not is_batch:
             if st.button(f"Send to {config.RECIPIENT_EMAIL}"):
                 with st.spinner("Sending..."):
                     ok, msg = send_email(
-                        excel_bytes  = excel_bytes,
-                        cost         = None,
-                        mode         = "Real-time API",
-                        file_count   = len(uploaded_files),
-                        item_count   = len(items),
-                        dup_warnings = dup_warnings or None,
+                        excel_bytes       = excel_bytes,
+                        cost              = None,
+                        mode              = "Real-time API",
+                        file_count        = len(uploaded_files),
+                        item_count        = len(items),
+                        dup_warnings      = dup_warnings or None,
+                        tally_erp9_bytes  = tally_erp9_bytes,
+                        tally_prime_bytes = tally_prime_bytes,
                     )
                 if ok:
                     st.success(f"✅ Sent to {config.RECIPIENT_EMAIL}")
@@ -300,15 +333,44 @@ if st.session_state["batch_submitted"] and st.session_state["batch_id"]:
             st.subheader("📋 Extracted Data")
             st.dataframe(items, use_container_width=True, hide_index=True)
 
-            # Manual download as fallback if email failed
+            # Manual downloads as fallback if email failed
             if not status.get("email_sent"):
-                excel_bytes = create_excel(items, dup_warnings or None)
-                st.download_button(
-                    label               = "⬇️ Download Invoice Register (.xlsx)",
-                    data                = excel_bytes,
-                    file_name           = f"Invoice_Register_{len(items)}_items.xlsx",
-                    mime                = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width = True,
+                excel_bytes       = create_excel(items, dup_warnings or None)
+                tally_erp9_bytes  = status.get("tally_erp9_bytes")
+                tally_prime_bytes = status.get("tally_prime_bytes")
+                ts                = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+                st.subheader("📥 Download Files")
+                dl1, dl2, dl3 = st.columns(3)
+                with dl1:
+                    st.download_button(
+                        label     = "⬇️ Invoice Register (.xlsx)",
+                        data      = excel_bytes,
+                        file_name = f"Invoice_Register_{len(items)}_items.xlsx",
+                        mime      = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width = True,
+                    )
+                with dl2:
+                    if tally_erp9_bytes:
+                        st.download_button(
+                            label     = "⬇️ Tally ERP 9 (.xml)",
+                            data      = tally_erp9_bytes.encode() if isinstance(tally_erp9_bytes, str) else tally_erp9_bytes,
+                            file_name = f"Tally_ERP9_{ts}.xml",
+                            mime      = "application/xml",
+                            use_container_width = True,
+                        )
+                with dl3:
+                    if tally_prime_bytes:
+                        st.download_button(
+                            label     = "⬇️ TallyPrime (.xml)",
+                            data      = tally_prime_bytes.encode() if isinstance(tally_prime_bytes, str) else tally_prime_bytes,
+                            file_name = f"Tally_Prime_{ts}.xml",
+                            mime      = "application/xml",
+                            use_container_width = True,
+                        )
+                st.caption(
+                    f"Tally XML uses default ledger: **{config.TALLY_DEFAULT_LEDGER}** "
+                    f"— reassign ledgers inside Tally after import."
                 )
 
         # ── Non-fatal warnings ──
@@ -345,4 +407,3 @@ st.divider()
 #     f"${config.PRICE_OUTPUT_PER_MTOK}/M output | "
 #     f"Batch: 50% off"
 # )
-# st.caption(f"Model: `{config.MODEL}`")
