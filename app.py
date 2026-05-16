@@ -47,6 +47,23 @@ st.set_page_config(
     layout     = "centered",
 )
 
+st.markdown(
+    """
+    <style>
+    header[data-testid="stHeader"],
+    div[data-testid="stToolbar"],
+    div[data-testid="stDecoration"],
+    div[data-testid="stStatusWidget"],
+    #MainMenu {
+        display: none !important;
+        visibility: hidden !important;
+        height: 0 !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 
 # ── Session state initialisation ─────────────────────────────────────────────
 

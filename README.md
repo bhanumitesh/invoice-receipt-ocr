@@ -88,24 +88,23 @@ Opens at http://localhost:8501
 
 ## How to Use
 
-### Real-time mode
+### Batch mode only
 1. Upload one or more invoice PDFs
-2. Select **Real-time API**
-3. Click **Process Invoices**
-4. Results appear on screen immediately
-5. Download Invoice Register (.xlsx), Tally ERP 9 (.xml), or TallyPrime (.xml) directly
-6. Optionally send all files via email
-
-### Batch mode
-1. Upload one or more invoice PDFs
-2. Select **Batch API (50% cheaper)**
-3. Click **Process Invoices** — button disables immediately
-4. Job submitted to Anthropic in background
-5. Status shown as In Progress → Complete / Failed
-6. When complete: Excel + both Tally XML files emailed automatically with cost summary
+2. The app counts pages, checks credits, and skips high-confidence duplicate uploaded PDFs
+3. Click **Process Invoices** — the button disables immediately
+4. Credits are reserved and the job is submitted to Anthropic Batch API in the background
+5. Status is shown as In Progress → Complete / Failed
+6. When complete: Excel + both Tally XML files are emailed automatically with duplicate summaries
 7. You can safely close the browser — polling continues in background
 
+Real-time processing code remains in the project, but the UI is temporarily disabled and all jobs use Batch API by default.
+
 ---
+
+
+### Session handling
+- Login sessions are stored in a browser cookie backed by hashed Supabase session records
+- Session IDs are not placed in the URL
 
 ## Output Files
 
@@ -128,7 +127,7 @@ Every run produces three files:
 - Upload-time precheck skips high-confidence duplicate PDFs before Claude processing
 - A PDF is auto-skipped only when both vendor GSTIN and invoice number are readable locally and match an earlier uploaded PDF
 - Ambiguous or scanned PDFs are still processed, then the post-Claude duplicate check runs as a fallback
-- Post-Claude duplicate handling prefers GSTIN + invoice number, and falls back to invoice number when GSTIN is missing
+- Post-Claude duplicate handling skips only duplicate line items, so multiple different line items from the same invoice are preserved
 - Skipped duplicates are shown as warnings in the UI and post-Claude skips also appear in a separate Excel sheet
 - Controlled by `SKIP_DUPLICATE_INVOICE_NUMBERS` env var for post-Claude deduplication
 
