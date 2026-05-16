@@ -3,11 +3,13 @@
 #  Run with:  streamlit run app.py
 # ─────────────────────────────────────────────
 
+import json
 import time
 import uuid
 from datetime import datetime
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 # ── Load .env file for local development ──────────────────────────────────
 try:
@@ -54,6 +56,7 @@ auth_defaults = {
     "user_credits": 0,
     "otp_sent":     False,
     "otp_email":    "",
+    "process_requested": False,
 }
 
 batch_defaults = {
@@ -70,31 +73,62 @@ for k, v in {**auth_defaults, **batch_defaults}.items():
         st.session_state[k] = v
 
 
-def _query_session_token() -> str:
+SESSION_COOKIE_NAME = "invoice_processor_session"
+
+
+def _legacy_query_session_token() -> str:
     token = st.query_params.get("session", "")
     if isinstance(token, list):
         token = token[0] if token else ""
     return str(token or "").strip()
 
 
-def _set_query_session(token: str):
-    if token:
-        st.query_params["session"] = token
+def _cookie_session_token() -> str:
+    return str(st.context.cookies.get(SESSION_COOKIE_NAME, "") or "").strip()
 
 
-def _clear_query_session():
+def _clear_legacy_query_session():
     if "session" in st.query_params:
         del st.query_params["session"]
+
+
+def _set_cookie_session(token: str, reload_page: bool = False):
+    if not token:
+        return
+    reload_js = "window.parent.location.reload();" if reload_page else ""
+    components.html(
+        f"""
+        <script>
+        document.cookie = {json.dumps(SESSION_COOKIE_NAME)} + "=" + encodeURIComponent({json.dumps(token)}) + "; Max-Age=2592000; Path=/; SameSite=Lax";
+        {reload_js}
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
+
+
+def _clear_cookie_session(reload_page: bool = False):
+    reload_js = "window.parent.location.reload();" if reload_page else ""
+    components.html(
+        f"""
+        <script>
+        document.cookie = {json.dumps(SESSION_COOKIE_NAME)} + "=; Max-Age=0; Path=/; SameSite=Lax";
+        {reload_js}
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
 
 
 def _restore_persisted_session():
     if st.session_state["logged_in"]:
         return
-    token = _query_session_token()
+    _clear_legacy_query_session()
+    token = _cookie_session_token()
     user = get_session_user(token) if token else None
     if not user:
-        if token:
-            _clear_query_session()
         return
     st.session_state["logged_in"] = True
     st.session_state["user_email"] = user["email"]
@@ -206,14 +240,15 @@ if not st.session_state["logged_in"]:
                         user_email_for_session = st.session_state["otp_email"]
                         session = create_session(user_email_for_session)
                         if session["success"]:
-                            _set_query_session(session["token"])
+                            _set_cookie_session(session["token"], reload_page=True)
 
                         st.session_state["logged_in"]    = True
                         st.session_state["user_email"]   = user_email_for_session
                         st.session_state["user_credits"] = result["credits"]
                         st.session_state["otp_sent"]     = False
                         st.session_state["otp_email"]    = ""
-                        st.rerun()
+                        st.success("Login successful. Opening your session...")
+                        st.stop()
                     else:
                         st.error(f"❌ {result['message']}")
 
@@ -251,11 +286,11 @@ with col_user:
         unsafe_allow_html=True,
     )
     if st.button("Sign out", use_container_width=True):
-        revoke_session(_query_session_token())
-        _clear_query_session()
+        revoke_session(_cookie_session_token())
         for k, v in {**auth_defaults, **batch_defaults}.items():
             st.session_state[k] = v
-        st.rerun()
+        _clear_cookie_session(reload_page=True)
+        st.stop()
 
 st.divider()
 
@@ -343,29 +378,33 @@ if uploaded_files:
 
 
 # ── Mode selection ────────────────────────────────────────────────────────────
+# Temporarily disabled: for now all jobs use Batch API by default.
+#
+# st.subheader("Processing Mode")
+# mode = st.radio(
+#     label="Choose how to process your invoices:",
+#     options=["⚡ Real-time API", "📦 Batch API (50% cheaper — results by email)"],
+#     index=1,
+# )
+# is_batch = mode.startswith("📦")
 
-st.subheader("Processing Mode")
-mode     = st.radio(
-    label   = "Choose how to process your invoices:",
-    options = ["⚡ Real-time API", "📦 Batch API (50% cheaper — results by email)"],
-    index   = 0,
+is_batch = True
+st.info(
+    f"📧 Results will be emailed to **{user_email}** when complete.\n\n"
+    f"⏱️ Status checked every **{config.POLL_INTERVAL_SECONDS // 60} minute(s)** in background.\n\n"
+    f"✅ You can safely close this tab — the job continues running.",
+    icon="ℹ️",
 )
-is_batch = mode.startswith("📦")
-
-if is_batch:
-    st.info(
-        f"📧 Results will be emailed to **{user_email}** when complete.\n\n"
-        f"⏱️ Status checked every **{config.POLL_INTERVAL_SECONDS // 60} minute(s)** in background.\n\n"
-        f"✅ You can safely close this tab — the job continues running.",
-        icon="ℹ️",
-    )
-else:
-    st.info("⚡ Results appear on this page immediately.", icon="ℹ️")
 
 st.divider()
 
 
 # ── Process button ────────────────────────────────────────────────────────────
+
+def _request_processing():
+    st.session_state["processing"] = True
+    st.session_state["process_requested"] = True
+
 
 btn_disabled = (
     not processing_files
@@ -375,12 +414,14 @@ btn_disabled = (
     or st.session_state["processing"]
 )
 
-process_btn = st.button(
+st.button(
     label               = "🚀 Process Invoices",
     disabled            = btn_disabled,
     use_container_width = True,
     type                = "primary",
+    on_click            = _request_processing,
 )
+process_requested = st.session_state.get("process_requested", False)
 
 if not uploaded_files:
     st.caption("⬆️ Upload at least one PDF to enable processing.")
@@ -396,7 +437,7 @@ elif page_count_error:
 #  REAL-TIME FLOW
 # ══════════════════════════════════════════════════════════════════════════════
 
-if process_btn and not is_batch:
+if process_requested and not is_batch:
     realtime_job_id = f"realtime_{uuid.uuid4().hex}"
     total_pages_for_reservation = selected_total_pages or len(processing_files)
 
@@ -413,6 +454,7 @@ if process_btn and not is_batch:
             result = process_realtime(processing_files)
 
         st.session_state["processing"] = False
+        st.session_state["process_requested"] = False
 
         if result["success"]:
             _finalize_credit_reservation(realtime_job_id)
@@ -509,13 +551,16 @@ if process_btn and not is_batch:
             st.error("❌ Processing failed.")
             with st.expander("Error details"):
                 st.code(result["error"])
+    else:
+        st.session_state["processing"] = False
+        st.session_state["process_requested"] = False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  BATCH FLOW — SUBMIT
 # ══════════════════════════════════════════════════════════════════════════════
 
-if process_btn and is_batch and not st.session_state["batch_submitted"]:
+if process_requested and is_batch and not st.session_state["batch_submitted"]:
 
     st.session_state["batch_submitted"] = True
     credit_job_id = f"batch_{uuid.uuid4().hex}"
@@ -536,6 +581,8 @@ if process_btn and is_batch and not st.session_state["batch_submitted"]:
             st.session_state["file_count"]        = len(processing_files)
             st.session_state["batch_total_pages"] = sub.get("total_pages") or total_pages_for_reservation
             st.session_state["credit_job_id"]     = credit_job_id
+            st.session_state["processing"]        = False
+            st.session_state["process_requested"] = False
             start_polling_thread(
                 sub["batch_id"],
                 len(processing_files),
@@ -550,9 +597,13 @@ if process_btn and is_batch and not st.session_state["batch_submitted"]:
                 reason=sub.get("error") or "Batch submission failed",
             )
             st.session_state["batch_submitted"] = False
+            st.session_state["processing"] = False
+            st.session_state["process_requested"] = False
             st.error(f"❌ Submission failed:\n{sub['error']}")
     else:
         st.session_state["batch_submitted"] = False
+        st.session_state["processing"] = False
+        st.session_state["process_requested"] = False
 
 
 # ══════════════════════════════════════════════════════════════════════════════

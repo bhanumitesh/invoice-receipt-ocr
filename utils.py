@@ -65,9 +65,11 @@ def count_uploaded_pdf_pages(uploaded_files: list) -> dict:
 
 GSTIN_RE = re.compile(r"\b[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]\b", re.I)
 
+INVOICE_NO_REJECTS = {"DATE", "DATED", "NO", "NUMBER", "INVOICE", "TAX", "MODE", "TERMS"}
+
 INVOICE_NO_PATTERNS = [
     re.compile(
-        r"\b(?:invoice|inv\.?|bill|document|doc\.?|voucher)\s*"
+        r"\b(?:invoice|inv\.?|bill)\s*"
         r"(?:no\.?|number|#)\s*[:\-]?\s*([A-Z0-9][A-Z0-9/._\-]{1,})",
         re.I,
     ),
@@ -92,12 +94,17 @@ def extract_invoice_identity_from_text(text: str) -> dict:
 
     invoice_no = ""
     for pattern in INVOICE_NO_PATTERNS:
-        match = pattern.search(source)
-        if match:
+        for match in pattern.finditer(source):
             candidate = _normalize_invoice_no(match.group(1))
-            if candidate and not GSTIN_RE.fullmatch(candidate):
+            if (
+                candidate
+                and candidate not in INVOICE_NO_REJECTS
+                and not GSTIN_RE.fullmatch(candidate)
+            ):
                 invoice_no = candidate
                 break
+        if invoice_no:
+            break
 
     key = f"{gstin}|{invoice_no}" if gstin and invoice_no else ""
     return {
@@ -261,9 +268,9 @@ def deduplicate_items(items: list) -> tuple:
     if not config.SKIP_DUPLICATE_INVOICE_NUMBERS:
         return items, []
 
-    seen_invoice_keys = {}
-    deduplicated      = []
-    warnings          = []
+    seen_line_keys = {}
+    deduplicated   = []
+    warnings       = []
 
     for item in items:
         inv_no = _normalize_invoice_no(item.get("invoice_no") or item.get("in") or "")
@@ -275,21 +282,32 @@ def deduplicate_items(items: list) -> tuple:
             deduplicated.append(item)
             continue
 
+        line_parts = [
+            str(item.get("description") or item.get("d") or "").strip().upper(),
+            str(item.get("hsn_code") or item.get("h") or "").strip().upper(),
+            str(item.get("qty") or item.get("q") or "").strip().upper(),
+            str(item.get("rate") or item.get("r") or "").strip().upper(),
+            str(item.get("taxable_value") or item.get("tv") or "").strip().upper(),
+            str(item.get("total_value") or item.get("t") or "").strip().upper(),
+        ]
+
         if gstin and GSTIN_RE.fullmatch(gstin):
-            dedup_key = f"gstin:{gstin}|invoice:{inv_no}"
+            invoice_identity = f"gstin:{gstin}|invoice:{inv_no}"
             label = f"GSTIN '{gstin}' + invoice number '{inv_no}'"
         else:
-            dedup_key = f"invoice:{inv_no}"
+            invoice_identity = f"invoice:{inv_no}"
             label = f"invoice number '{inv_no}'"
 
-        if dedup_key not in seen_invoice_keys:
-            seen_invoice_keys[dedup_key] = vendor
+        dedup_key = invoice_identity + "|line:" + "|".join(line_parts)
+
+        if dedup_key not in seen_line_keys:
+            seen_line_keys[dedup_key] = vendor
             deduplicated.append(item)
         else:
             warn = (
-                f"Duplicate {label} "
+                f"Duplicate line item for {label} "
                 f"(vendor: {vendor}) — skipped. "
-                f"First occurrence kept from: {seen_invoice_keys[dedup_key]}"
+                f"First occurrence kept from: {seen_line_keys[dedup_key]}"
             )
             warnings.append(warn)
 
