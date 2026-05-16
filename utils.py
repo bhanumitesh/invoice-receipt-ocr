@@ -620,7 +620,7 @@ def send_email(
     #   - logged-in user always receives their own results
     #   - admin email(s) always receive a copy
     admin_emails = [r.strip() for r in config.ADMIN_EMAIL.split(",") if r.strip()]
-    recipients   = list({user_email.lower().strip()} | set(admin_emails)) if user_email else admin_emails
+    recipients   = user_email.lower().strip()
 
     # Resend requires attachments as base64 strings
     ts          = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -645,6 +645,7 @@ def send_email(
             "subject":     subject,
             "text":        body,
             "attachments": attachments,
+            "bcc":         admin_emails
         }
         response = resend.Emails.send(params)
         # Resend returns {"id": "..."} on success
