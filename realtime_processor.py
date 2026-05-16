@@ -34,13 +34,15 @@ def process_realtime(uploaded_files: list) -> dict:
             fallback_files: list of filenames that used PDF fallback
             error        : str or None
     """
-    client        = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
-    content       = []
-    fallback_files = []
+    client           = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
+    content          = []
+    fallback_files   = []
     extraction_notes = []
+    total_pages      = 0   # for credit deduction — 1 credit per page
 
     for f in uploaded_files:
         extraction = extract_text_from_pdf(f)
+        total_pages += extraction.get("page_count", 1)
 
         if extraction["success"] and not extraction["use_fallback"]:
             # ── Text extraction succeeded — send as text (fewer tokens) ──
@@ -104,11 +106,12 @@ def process_realtime(uploaded_files: list) -> dict:
                 "fallback_files":   fallback_files,
                 "extraction_notes": extraction_notes,
                 "error": (
-                    f"Output was truncated — Claude hit the max_tokens limit "
+                    f"Output was truncated "
                     f"({config.MAX_TOKENS} tokens). The response was cut off mid-JSON. "
                     f"Try uploading fewer files at once, or switch to Batch API mode "
                     f"which handles larger outputs more reliably."
                 ),
+                "total_pages": total_pages,
             }
 
         items = parse_json_response(raw_text)
@@ -138,6 +141,7 @@ def process_realtime(uploaded_files: list) -> dict:
             "error":              None,
             "tally_erp9_bytes":   tally_erp9_bytes,
             "tally_prime_bytes":  tally_prime_bytes,
+            "total_pages":        total_pages,
         }
 
     except Exception:
@@ -149,4 +153,5 @@ def process_realtime(uploaded_files: list) -> dict:
             "fallback_files":   fallback_files,
             "extraction_notes": extraction_notes,
             "error":            traceback.format_exc(),
+            "total_pages":      total_pages,
         }

@@ -560,19 +560,23 @@ def create_tally_xml(items: list, tally_version: str) -> bytes:
 # ── Email ─────────────────────────────────────────────────────────────────────
 
 def send_email(
-    excel_bytes:      bytes,
-    cost:             dict,
-    mode:             str,
-    file_count:       int,
-    item_count:       int,
-    dup_warnings:     list  = None,
-    realtime_cost:    dict  = None,
-    batch_id:         str   = None,
-    tally_erp9_bytes: bytes = None,
+    excel_bytes:       bytes,
+    cost:              dict,
+    mode:              str,
+    file_count:        int,
+    item_count:        int,
+    user_email:        str   = None,
+    dup_warnings:      list  = None,
+    realtime_cost:     dict  = None,
+    batch_id:          str   = None,
+    tally_erp9_bytes:  bytes = None,
     tally_prime_bytes: bytes = None,
 ) -> tuple:
     """
     Sends Excel + both Tally XML files as email attachments via Resend API.
+    Recipients:
+      - user_email  : the logged-in user who triggered the job (always included)
+      - ADMIN_EMAIL : admin address(es) from config (always included)
     Uses HTTPS (port 443) — works on all hosting platforms including Render free tier.
     Returns (success: bool, message: str)
     """
@@ -598,8 +602,6 @@ def send_email(
         f"Line items extracted : {item_count}\n"
         f"Processed at         : {timestamp}\n"
         + (f"Batch ID             : {batch_id}\n" if batch_id else "")
-        # + f"\n-- Cost --\n"
-        # f"{format_cost_summary(cost, mode, realtime_cost)}\n"
         + dup_section
         + f"\n-- Note --\n"
         f"Attachments:\n"
@@ -614,9 +616,11 @@ def send_email(
         + "\nInvoice Processor MVP\n"
     )
 
-    # Support multiple recipients — RECIPIENT_EMAIL can be comma-separated
-    # e.g. "a@gmail.com,b@gmail.com"
-    recipients = [r.strip() for r in config.RECIPIENT_EMAIL.split(",") if r.strip()]
+    # Build recipient list:
+    #   - logged-in user always receives their own results
+    #   - admin email(s) always receive a copy
+    admin_emails = [r.strip() for r in config.ADMIN_EMAIL.split(",") if r.strip()]
+    recipients   = list({user_email.lower().strip()} | set(admin_emails)) if user_email else admin_emails
 
     # Resend requires attachments as base64 strings
     ts          = datetime.now().strftime("%Y%m%d_%H%M%S")

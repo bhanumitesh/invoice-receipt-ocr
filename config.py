@@ -2,21 +2,9 @@
 #  config.py  –  All settings for Invoice Processor MVP
 #
 #  DEPLOYMENT NOTE:
-#  Sensitive values are read from environment variables.
-#  Set these on your server before running:
-#
-#    ANTHROPIC_API_KEY   → your Anthropic API key
-#    GMAIL_SENDER        → Gmail address used to send emails
-#    GMAIL_APP_PASS      → Gmail App Password (16 chars)
-#    RECIPIENT_EMAIL     → email address to receive Excel reports
-#
-#  For local development, create a .env file and load it with:
-#    pip install python-dotenv
-#    and add: from dotenv import load_dotenv; load_dotenv()
-#    at the top of app.py
-#
-#  Non-sensitive settings are hardcoded below and can be
-#  overridden via env vars too if needed.
+#  All sensitive values are read from environment variables.
+#  For local development use a .env file (see .env.example).
+#  For server deployment (Render etc.) set env vars directly.
 # ─────────────────────────────────────────────
 
 import os
@@ -66,7 +54,23 @@ MAX_TOKENS = int(_optional("MAX_TOKENS", "8192"))
 #                  e.g. "a@gmail.com,b@gmail.com"
 RESEND_API_KEY  = _require("RESEND_API_KEY")
 RESEND_SENDER   = _require("RESEND_SENDER")
-RECIPIENT_EMAIL = _require("RECIPIENT_EMAIL")
+
+# ── Email recipients ───────────────────────────────────────────────────────
+# ADMIN_EMAIL: always receives the output files (Excel + Tally XML)
+#              comma-separated for multiple admins
+# Note: the logged-in user's email is also always added as a recipient
+#       automatically — no need to list users here
+ADMIN_EMAIL = _require("ADMIN_EMAIL")
+
+# ── Supabase (required for auth + credits) ─────────────────────────────────
+# Sign up free at supabase.com — 500MB database permanently free
+# SUPABASE_URL : Project URL from Supabase dashboard → Settings → API
+# SUPABASE_KEY : anon/public key from Supabase dashboard → Settings → API
+SUPABASE_URL = _require("SUPABASE_URL")
+SUPABASE_KEY = _require("SUPABASE_KEY")
+
+# ── OTP settings ───────────────────────────────────────────────────────────
+OTP_EXPIRY_MINUTES = int(_optional("OTP_EXPIRY_MINUTES", "10"))
 
 # ── Tally XML settings ────────────────────────────────────────────────────
 # Default ledger all purchase line items post to.

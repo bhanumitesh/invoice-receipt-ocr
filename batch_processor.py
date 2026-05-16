@@ -148,12 +148,12 @@ def _build_content(uploaded_files: list, batch_id: str = None) -> tuple:
 
 # ── Submit ────────────────────────────────────────────────────────────────────
 
-def submit_batch(uploaded_files: list) -> dict:
+def submit_batch(uploaded_files: list, user_email: str = None) -> dict:
     """
     Submits all uploaded PDFs as a single Batch API job.
 
     Returns:
-        dict: success, batch_id, fallback_files, extraction_notes, error
+        dict: success, batch_id, fallback_files, extraction_notes, error, user_email
     """
     client   = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
     batch_id = None
@@ -184,12 +184,14 @@ def submit_batch(uploaded_files: list) -> dict:
             for note in extraction_notes:
                 write_log(batch_id, f"Note: {note}")
 
+        write_log(batch_id, f"User: {user_email or 'unknown'}")
         return {
             "success":          True,
             "batch_id":         batch_id,
             "fallback_files":   fallback_files,
             "extraction_notes": extraction_notes,
             "error":            None,
+            "user_email":       user_email,
         }
 
     except Exception:
@@ -204,7 +206,7 @@ def submit_batch(uploaded_files: list) -> dict:
 
 # ── Poll ──────────────────────────────────────────────────────────────────────
 
-def poll_until_done(batch_id: str, file_count: int):
+def poll_until_done(batch_id: str, file_count: int, user_email: str = None):
     """
     Background daemon thread.
     Polls batch status — writes ONLY to log/status files, never session_state.
@@ -228,7 +230,7 @@ def poll_until_done(batch_id: str, file_count: int):
 
             if batch.processing_status == "ended":
                 write_log(batch_id, "Batch ended — retrieving results...")
-                result = retrieve_results(batch_id, file_count, client)
+                result = retrieve_results(batch_id, file_count, client, user_email=user_email)
                 write_status(batch_id, result)
 
                 if result["success"]:
@@ -248,10 +250,10 @@ def poll_until_done(batch_id: str, file_count: int):
         time.sleep(config.POLL_INTERVAL_SECONDS)
 
 
-def start_polling_thread(batch_id: str, file_count: int) -> threading.Thread:
+def start_polling_thread(batch_id: str, file_count: int, user_email: str = None) -> threading.Thread:
     t = threading.Thread(
         target=poll_until_done,
-        args=(batch_id, file_count),
+        args=(batch_id, file_count, user_email),
         daemon=True,
     )
     t.start()
@@ -260,7 +262,7 @@ def start_polling_thread(batch_id: str, file_count: int) -> threading.Thread:
 
 # ── Retrieve results ──────────────────────────────────────────────────────────
 
-def retrieve_results(batch_id: str, file_count: int, client=None) -> dict:
+def retrieve_results(batch_id: str, file_count: int, client=None, user_email: str = None) -> dict:
     if client is None:
         client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
 
@@ -350,6 +352,7 @@ def retrieve_results(batch_id: str, file_count: int, client=None) -> dict:
             mode              = "Batch API",
             file_count        = file_count,
             item_count        = len(all_items),
+            user_email        = user_email,
             dup_warnings      = dup_warnings or None,
             realtime_cost     = realtime_cost,
             batch_id          = batch_id,
