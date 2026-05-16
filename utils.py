@@ -7,6 +7,7 @@ import base64
 import hashlib
 import io
 import json
+import re
 import traceback
 from datetime import datetime
 
@@ -18,6 +19,142 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 import config
+
+
+# ── PDF page counting ─────────────────────────────────────────────────────────
+
+def count_pdf_pages(file) -> dict:
+    """Returns the number of pages in an uploaded PDF without extracting text."""
+    try:
+        file.seek(0)
+        with pdfplumber.open(file) as pdf:
+            page_count = len(pdf.pages)
+        file.seek(0)
+        return {"success": True, "page_count": page_count, "error": None}
+    except Exception as e:
+        try:
+            file.seek(0)
+        except Exception:
+            pass
+        return {"success": False, "page_count": 0, "error": str(e)}
+
+
+def count_uploaded_pdf_pages(uploaded_files: list) -> dict:
+    """Counts pages for all uploaded PDFs and returns per-file detail."""
+    total_pages = 0
+    files = []
+    errors = []
+
+    for f in uploaded_files or []:
+        result = count_pdf_pages(f)
+        files.append({"name": f.name, **result})
+        if result["success"]:
+            total_pages += result["page_count"]
+        else:
+            errors.append(f"{f.name}: {result['error']}")
+
+    return {
+        "success": not errors,
+        "total_pages": total_pages,
+        "files": files,
+        "errors": errors,
+    }
+
+
+# ── Upload-time duplicate detection ───────────────────────────────────────────
+
+GSTIN_RE = re.compile(r"\b[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]\b", re.I)
+
+INVOICE_NO_PATTERNS = [
+    re.compile(
+        r"\b(?:invoice|inv\.?|bill|document|doc\.?|voucher)\s*"
+        r"(?:no\.?|number|#)\s*[:\-]?\s*([A-Z0-9][A-Z0-9/._\-]{1,})",
+        re.I,
+    ),
+    re.compile(r"\b(?:invoice|inv\.?)\s*#\s*([A-Z0-9][A-Z0-9/._\-]{1,})", re.I),
+]
+
+
+def _normalize_invoice_no(value: str) -> str:
+    value = str(value or "").strip().upper()
+    value = value.strip(" .,:;#")
+    return re.sub(r"\s+", "", value)
+
+
+def extract_invoice_identity_from_text(text: str) -> dict:
+    """
+    Extracts a strict duplicate identity from local PDF text.
+    Only returns a usable key when both GSTIN and invoice number are found.
+    """
+    source = text or ""
+    gstin_match = GSTIN_RE.search(source)
+    gstin = gstin_match.group(0).upper() if gstin_match else ""
+
+    invoice_no = ""
+    for pattern in INVOICE_NO_PATTERNS:
+        match = pattern.search(source)
+        if match:
+            candidate = _normalize_invoice_no(match.group(1))
+            if candidate and not GSTIN_RE.fullmatch(candidate):
+                invoice_no = candidate
+                break
+
+    key = f"{gstin}|{invoice_no}" if gstin and invoice_no else ""
+    return {
+        "gstin": gstin,
+        "invoice_no": invoice_no,
+        "key": key,
+        "usable": bool(key),
+    }
+
+
+def detect_duplicate_uploads(uploaded_files: list) -> dict:
+    """
+    Best-effort upload-time duplicate detection.
+    Skips only high-confidence duplicates using vendor GSTIN + invoice number.
+    """
+    seen = {}
+    unique_files = []
+    duplicates = []
+    unidentified = []
+    identities = []
+
+    for f in uploaded_files or []:
+        extraction = extract_text_from_pdf(f)
+        identity = extract_invoice_identity_from_text(extraction.get("text", "")) if extraction.get("success") else {
+            "gstin": "",
+            "invoice_no": "",
+            "key": "",
+            "usable": False,
+        }
+        f.seek(0)
+
+        record = {"name": f.name, **identity}
+        identities.append(record)
+
+        if not identity["usable"]:
+            unique_files.append(f)
+            unidentified.append(f.name)
+            continue
+
+        if identity["key"] in seen:
+            duplicates.append({
+                "name": f.name,
+                "duplicate_of": seen[identity["key"]],
+                "gstin": identity["gstin"],
+                "invoice_no": identity["invoice_no"],
+            })
+            continue
+
+        seen[identity["key"]] = f.name
+        unique_files.append(f)
+
+    return {
+        "unique_files": unique_files,
+        "duplicates": duplicates,
+        "unidentified": unidentified,
+        "identities": identities,
+    }
 
 
 # ── PDF text extraction ───────────────────────────────────────────────────────
@@ -124,26 +261,35 @@ def deduplicate_items(items: list) -> tuple:
     if not config.SKIP_DUPLICATE_INVOICE_NUMBERS:
         return items, []
 
-    seen_invoice_nos = {}
-    deduplicated    = []
-    warnings        = []
+    seen_invoice_keys = {}
+    deduplicated      = []
+    warnings          = []
 
     for item in items:
-        inv_no = str(item.get("in", "") or "").strip()
+        inv_no = _normalize_invoice_no(item.get("invoice_no") or item.get("in") or "")
+        gstin = str(item.get("gstin") or item.get("g") or "").strip().upper()
+        vendor = item.get("party_name") or item.get("pn") or "Unknown vendor"
 
         # Skip blank or null invoice numbers from dedup check
         if not inv_no or inv_no.lower() in ("null", "none", ""):
             deduplicated.append(item)
             continue
 
-        if inv_no not in seen_invoice_nos:
-            seen_invoice_nos[inv_no] = item.get("pn", "Unknown vendor")
+        if gstin and GSTIN_RE.fullmatch(gstin):
+            dedup_key = f"gstin:{gstin}|invoice:{inv_no}"
+            label = f"GSTIN '{gstin}' + invoice number '{inv_no}'"
+        else:
+            dedup_key = f"invoice:{inv_no}"
+            label = f"invoice number '{inv_no}'"
+
+        if dedup_key not in seen_invoice_keys:
+            seen_invoice_keys[dedup_key] = vendor
             deduplicated.append(item)
         else:
             warn = (
-                f"Duplicate invoice number '{inv_no}' "
-                f"(vendor: {item.get('pn', 'Unknown')}) — skipped. "
-                f"First occurrence kept from: {seen_invoice_nos[inv_no]}"
+                f"Duplicate {label} "
+                f"(vendor: {vendor}) — skipped. "
+                f"First occurrence kept from: {seen_invoice_keys[dedup_key]}"
             )
             warnings.append(warn)
 
@@ -567,6 +713,7 @@ def send_email(
     item_count:        int,
     user_email:        str   = None,
     dup_warnings:      list  = None,
+    upload_dup_warnings: list = None,
     realtime_cost:     dict  = None,
     batch_id:          str   = None,
     tally_erp9_bytes:  bytes = None,
@@ -586,10 +733,23 @@ def send_email(
     filename  = f"Invoice_Register_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
     subject   = f"Invoice Register Ready - {file_count} file(s) | {timestamp}"
 
+    upload_dup_section = ""
+    if upload_dup_warnings:
+        upload_dup_section = (
+            "\n-- Upload Duplicate PDF Warnings --\n"
+            + "\n".join(
+                f"  * {d.get('name')} skipped: same GSTIN + invoice number "
+                f"as {d.get('duplicate_of')} "
+                f"(GSTIN: {d.get('gstin')}, Invoice: {d.get('invoice_no')})"
+                for d in upload_dup_warnings
+            )
+            + "\n"
+        )
+
     dup_section = ""
     if dup_warnings:
         dup_section = (
-            "\n-- Duplicate Invoice Warnings --\n"
+            "\n-- Extracted Duplicate Invoice Warnings --\n"
             + "\n".join(f"  * {w}" for w in dup_warnings)
             + "\n"
         )
@@ -598,10 +758,13 @@ def send_email(
         f"Hi,\n\n"
         f"Your invoice extraction is complete.\n\n"
         f"-- Summary --\n"
-        f"Files processed      : {file_count}\n"
-        f"Line items extracted : {item_count}\n"
-        f"Processed at         : {timestamp}\n"
+        f"Files processed                : {file_count}\n"
+        f"Upload duplicate PDFs skipped  : {len(upload_dup_warnings or [])}\n"
+        f"Extracted duplicates skipped   : {len(dup_warnings or [])}\n"
+        f"Line items extracted           : {item_count}\n"
+        f"Processed at                   : {timestamp}\n"
         + (f"Batch ID             : {batch_id}\n" if batch_id else "")
+        + upload_dup_section
         + dup_section
         + f"\n-- Note --\n"
         f"Attachments:\n"
@@ -612,7 +775,7 @@ def send_email(
         f"Default ledger used: {config.TALLY_DEFAULT_LEDGER}\n"
         f"Reassign ledgers inside Tally after import as needed.\n"
         f"Missing fields are left blank.\n"
-        + (f"See 'Duplicate Warnings' sheet in Excel for skipped invoices.\n" if dup_warnings else "")
+        + (f"See 'Duplicate Warnings' sheet in Excel for extracted duplicate invoices.\n" if dup_warnings else "")
         + "\nInvoice Processor MVP\n"
     )
 
@@ -620,7 +783,7 @@ def send_email(
     #   - logged-in user always receives their own results
     #   - admin email(s) always receive a copy
     admin_emails = [r.strip() for r in config.ADMIN_EMAIL.split(",") if r.strip()]
-    recipients   = user_email.lower().strip()
+    recipients   = [user_email.lower().strip()]
 
     # Resend requires attachments as base64 strings
     ts          = datetime.now().strftime("%Y%m%d_%H%M%S")

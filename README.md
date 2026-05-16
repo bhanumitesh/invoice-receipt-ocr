@@ -46,7 +46,9 @@ cp .env.example .env
 | `ANTHROPIC_API_KEY` | Anthropic API key | console.anthropic.com → API Keys |
 | `RESEND_API_KEY` | Resend email API key | resend.com → API Keys |
 | `RESEND_SENDER` | Verified sender address | resend.com → Domains (or use `onboarding@resend.dev` for testing) |
-| `RECIPIENT_EMAIL` | Where to send reports — comma-separated for multiple | e.g. `a@gmail.com,b@gmail.com` |
+| `ADMIN_EMAIL` | Admin report recipients, sent as BCC — comma-separated for multiple | e.g. `admin1@gmail.com,admin2@gmail.com` |
+| `SUPABASE_URL` | Supabase project URL | Supabase dashboard → Settings → API |
+| `SUPABASE_KEY` | Supabase anon/public key | Supabase dashboard → Settings → API |
 
 #### Optional variables (defaults shown)
 
@@ -73,7 +75,10 @@ block outbound SMTP ports. Resend uses HTTPS and works everywhere.
    - **Testing/MVP**: use `onboarding@resend.dev` as `RESEND_SENDER` (works immediately, recipients must be your own verified email)
    - **Production**: go to Domains → Add Domain → follow DNS instructions → use `invoices@yourdomain.com`
 
-### 4. Run the app
+### 4. Create Supabase tables
+Run `supabase_setup.sql` in the Supabase SQL editor. The app requires `users`, `otp_tokens`, `auth_sessions`, `credit_transactions`, and the credit reservation RPC functions in that SQL file.
+
+### 5. Run the app
 ```bash
 streamlit run app.py
 ```
@@ -120,14 +125,20 @@ Every run produces three files:
 - Both ERP 9 and TallyPrime files are always generated — use whichever applies to your version
 
 ### Duplicate invoice handling
-- If the same invoice number appears across multiple uploaded files, only the first is kept
-- Skipped duplicates shown as warnings in the UI and in a separate sheet in the Excel file
-- Controlled by `SKIP_DUPLICATE_INVOICE_NUMBERS` env var
+- Upload-time precheck skips high-confidence duplicate PDFs before Claude processing
+- A PDF is auto-skipped only when both vendor GSTIN and invoice number are readable locally and match an earlier uploaded PDF
+- Ambiguous or scanned PDFs are still processed, then the post-Claude duplicate check runs as a fallback
+- Post-Claude duplicate handling prefers GSTIN + invoice number, and falls back to invoice number when GSTIN is missing
+- Skipped duplicates are shown as warnings in the UI and post-Claude skips also appear in a separate Excel sheet
+- Controlled by `SKIP_DUPLICATE_INVOICE_NUMBERS` env var for post-Claude deduplication
 
 ---
 
 ## PDF handling
 
+- Uploaded PDFs are page-counted before processing, so users see required credits upfront
+- Processing is blocked when selected PDF pages exceed available credits
+- Credits are reserved atomically when processing starts, finalized on extraction success, and refunded on extraction failure
 - **Text-based PDFs** (most invoices): text extracted via pdfplumber — cheaper, fewer tokens
 - **Scanned/image PDFs**: automatically detected and sent as PDF binary (fallback) — works but costs more
 - **Duplicate pages**: exact duplicate pages within a PDF are detected via MD5 hash and skipped
@@ -164,7 +175,8 @@ app.py  (Streamlit UI)
     └── utils.py  (shared)
             ├── extract_text_from_pdf()  — pdfplumber extraction + dedup + fallback detection
             ├── parse_json_response()    — parses abbreviated JSON, expands keys, detects truncation
-            ├── deduplicate_items()      — removes duplicate invoice numbers
+            ├── detect_duplicate_uploads() — skips high-confidence duplicate PDFs before Claude
+            ├── deduplicate_items()      — fallback duplicate removal after extraction
             ├── create_excel()           — formatted Excel with optional warnings sheet
             ├── create_tally_xml()       — TallyXML for ERP 9 and TallyPrime
             ├── calculate_cost()         — token-based cost calculation
@@ -182,7 +194,7 @@ All thread-to-UI communication uses files in `batch_logs/`:
 ## Known limitations (MVP)
 
 - Batch polling thread does not survive server restarts — resubmit if this happens
-- No user authentication — anyone with the URL can use the app
-- No persistent storage — session state lost on page refresh for real-time mode
+- If a server restart interrupts an in-progress job, a reserved credit transaction may need admin review/refund in Supabase
+- Real-time extraction results are not persisted after leaving the completed page
 - Ledger mapping is manual inside Tally — automated mapping planned for future
 - Tally XML uses Purchase voucher type only — Sales vouchers planned for future

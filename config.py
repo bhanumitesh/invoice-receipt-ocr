@@ -50,8 +50,8 @@ MAX_TOKENS = int(_optional("MAX_TOKENS", "8192"))
 # RESEND_SENDER  : verified sender address, e.g. "Invoice Processor <invoices@yourdomain.com>"
 #                  On Resend free tier you can use "onboarding@resend.dev" for testing
 #                  For production, verify your own domain at resend.com/domains
-# RECIPIENT_EMAIL: supports multiple comma-separated addresses
-#                  e.g. "a@gmail.com,b@gmail.com"
+# ADMIN_EMAIL: supports multiple comma-separated admin addresses
+#              e.g. "admin1@gmail.com,admin2@gmail.com"
 RESEND_API_KEY  = _require("RESEND_API_KEY")
 RESEND_SENDER   = _require("RESEND_SENDER")
 

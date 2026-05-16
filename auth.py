@@ -3,7 +3,7 @@
 #  OTP generation, validation, email sending
 # ─────────────────────────────────────────────
 
-import random
+import secrets
 import string
 import traceback
 from datetime import datetime, timedelta, timezone
@@ -16,7 +16,7 @@ from db import get_user, save_otp, verify_otp
 
 def generate_otp(length: int = 6) -> str:
     """Generates a numeric OTP of given length."""
-    return "".join(random.choices(string.digits, k=length))
+    return "".join(secrets.choice(string.digits) for _ in range(length))
 
 
 def send_otp_email(email: str, otp: str) -> dict:

@@ -19,8 +19,10 @@
 #    created_at  timestamptz default now()
 # ─────────────────────────────────────────────
 
+import hashlib
+import secrets
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from supabase import create_client
 
@@ -61,49 +63,175 @@ def get_user_credits(email: str) -> int:
     return user.get("credits", 0)
 
 
-def deduct_credits(email: str, pages: int) -> dict:
-    """
-    Deducts `pages` credits from the user's account.
-    Only deducts if user has enough credits.
+def _hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
-    Returns:
-        {
-            "success":           bool
-            "credits_before":    int
-            "credits_after":     int
-            "credits_deducted":  int
-            "error":             str or None
-        }
-    """
+
+def create_session(email: str, days: int = 30) -> dict:
+    """Creates a persisted browser session token for a validated user."""
     try:
-        user = get_user(email)
-        if user is None:
-            return {"success": False, "error": "User not found", "credits_before": 0,
-                    "credits_after": 0, "credits_deducted": 0}
+        email = email.lower().strip()
+        token = secrets.token_urlsafe(32)
+        expires_at = datetime.now(timezone.utc) + timedelta(days=days)
+        _db().table("auth_sessions").insert({
+            "email": email,
+            "token_hash": _hash_token(token),
+            "expires_at": expires_at.isoformat(),
+            "revoked": False,
+        }).execute()
+        return {"success": True, "token": token, "expires_at": expires_at}
+    except Exception:
+        return {"success": False, "token": None, "error": traceback.format_exc()}
 
-        credits_before = user.get("credits", 0)
-        to_deduct      = min(pages, credits_before)  # never go below 0
-        credits_after  = credits_before - to_deduct
 
-        _db().table("users").update({"credits": credits_after}).eq(
-            "email", email.lower().strip()
+def get_session_user(token: str) -> dict:
+    """Returns the active user for a persisted session token, or None."""
+    if not token:
+        return None
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        res = (
+            _db().table("auth_sessions")
+            .select("*")
+            .eq("token_hash", _hash_token(token))
+            .eq("revoked", False)
+            .gt("expires_at", now)
+            .execute()
+        )
+        if not res.data:
+            return None
+        user = get_user(res.data[0]["email"])
+        if user and user.get("is_active", False):
+            return user
+        return None
+    except Exception:
+        return None
+
+
+def revoke_session(token: str) -> bool:
+    """Revokes a persisted session token."""
+    if not token:
+        return True
+    try:
+        _db().table("auth_sessions").update({"revoked": True}).eq(
+            "token_hash", _hash_token(token)
         ).execute()
+        return True
+    except Exception:
+        return False
 
+
+def _rpc_data(response):
+    data = getattr(response, "data", None)
+    if isinstance(data, list):
+        return data[0] if data else None
+    return data
+
+
+def get_credit_transaction(job_id: str) -> dict:
+    if not job_id:
+        return None
+    try:
+        res = _db().table("credit_transactions").select("*").eq("job_id", job_id).execute()
+        return res.data[0] if res.data else None
+    except Exception:
+        return None
+
+
+def reserve_credits(email: str, pages: int, job_id: str, mode: str) -> dict:
+    """Atomically reserves credits before processing starts."""
+    try:
+        response = _db().rpc("reserve_credits", {
+            "p_email": email.lower().strip(),
+            "p_job_id": job_id,
+            "p_pages": max(int(pages or 0), 0),
+            "p_mode": mode,
+        }).execute()
+        data = _rpc_data(response) or {}
         return {
-            "success":          True,
-            "credits_before":   credits_before,
-            "credits_after":    credits_after,
-            "credits_deducted": to_deduct,
-            "error":            None,
+            "success": bool(data.get("success")),
+            "already_reserved": bool(data.get("already_reserved", False)),
+            "credits_before": data.get("credits_before", 0),
+            "credits_after": data.get("credits_after", 0),
+            "credits_reserved": data.get("credits_reserved", data.get("credits_deducted", 0)),
+            "error": data.get("error"),
         }
     except Exception:
         return {
-            "success":          False,
-            "credits_before":   0,
-            "credits_after":    0,
-            "credits_deducted": 0,
-            "error":            traceback.format_exc(),
+            "success": False,
+            "already_reserved": False,
+            "credits_before": 0,
+            "credits_after": 0,
+            "credits_reserved": 0,
+            "error": traceback.format_exc(),
         }
+
+
+def finalize_credit_reservation(job_id: str) -> dict:
+    """Marks a reserved credit transaction as completed. No extra credits move."""
+    try:
+        response = _db().rpc("finalize_credit_reservation", {
+            "p_job_id": job_id,
+        }).execute()
+        data = _rpc_data(response) or {}
+        return {
+            "success": bool(data.get("success")),
+            "status": data.get("status"),
+            "error": data.get("error"),
+        }
+    except Exception:
+        return {"success": False, "status": None, "error": traceback.format_exc()}
+
+
+def refund_credit_reservation(job_id: str, reason: str = None) -> dict:
+    """Refunds a reserved transaction once if processing fails."""
+    try:
+        response = _db().rpc("refund_credit_reservation", {
+            "p_job_id": job_id,
+            "p_reason": reason or "Processing failed",
+        }).execute()
+        data = _rpc_data(response) or {}
+        return {
+            "success": bool(data.get("success")),
+            "already_refunded": bool(data.get("already_refunded", False)),
+            "credits_before": data.get("credits_before", 0),
+            "credits_after": data.get("credits_after", 0),
+            "credits_refunded": data.get("credits_refunded", 0),
+            "error": data.get("error"),
+        }
+    except Exception:
+        return {
+            "success": False,
+            "already_refunded": False,
+            "credits_before": 0,
+            "credits_after": 0,
+            "credits_refunded": 0,
+            "error": traceback.format_exc(),
+        }
+
+
+# Backward-compatible wrapper for any older call sites. Prefer reserve/finalize/refund.
+def deduct_credits(email: str, pages: int, job_id: str = None) -> dict:
+    job_id = job_id or f"legacy_{secrets.token_urlsafe(12)}"
+    reserved = reserve_credits(email, pages, job_id, mode="legacy")
+    if reserved["success"]:
+        finalize_credit_reservation(job_id)
+        return {
+            "success": True,
+            "already_deducted": reserved.get("already_reserved", False),
+            "credits_before": reserved.get("credits_before", 0),
+            "credits_after": reserved.get("credits_after", 0),
+            "credits_deducted": reserved.get("credits_reserved", 0),
+            "error": None,
+        }
+    return {
+        "success": False,
+        "already_deducted": False,
+        "credits_before": reserved.get("credits_before", 0),
+        "credits_after": reserved.get("credits_before", 0),
+        "credits_deducted": 0,
+        "error": reserved.get("error"),
+    }
 
 
 # ── OTP operations ────────────────────────────────────────────────────────────

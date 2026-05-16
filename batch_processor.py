@@ -19,6 +19,7 @@ from pathlib import Path
 import anthropic
 
 import config
+from db import finalize_credit_reservation, refund_credit_reservation
 from utils import (
     calculate_cost,
     create_excel,
@@ -56,8 +57,18 @@ def read_logs(batch_id: str) -> list:
         return [l.rstrip("\n") for l in f.readlines()]
 
 
+def _status_safe_value(value):
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
+
+
 def write_status(batch_id: str, result: dict):
-    safe = {k: v for k, v in result.items() if k != "excel_bytes"}
+    safe = {
+        k: _status_safe_value(v)
+        for k, v in result.items()
+        if k != "excel_bytes"
+    }
     with open(_status_path(batch_id), "w", encoding="utf-8") as f:
         json.dump(safe, f, indent=2, default=str)
 
@@ -94,9 +105,11 @@ def _build_content(uploaded_files: list, batch_id: str = None) -> tuple:
     content          = []
     fallback_files   = []
     extraction_notes = []
+    total_pages      = 0
 
     for f in uploaded_files:
         extraction = extract_text_from_pdf(f)
+        total_pages += extraction.get("page_count", 1) or 1
 
         if extraction["success"] and not extraction["use_fallback"]:
             notes = []
@@ -143,7 +156,7 @@ def _build_content(uploaded_files: list, batch_id: str = None) -> tuple:
         "text": config.EXTRACTION_PROMPT,
     })
 
-    return content, fallback_files, extraction_notes
+    return content, fallback_files, extraction_notes, total_pages
 
 
 # ── Submit ────────────────────────────────────────────────────────────────────
@@ -160,7 +173,7 @@ def submit_batch(uploaded_files: list, user_email: str = None) -> dict:
 
     try:
         # Build content — no batch_id yet so no log writes during build
-        content, fallback_files, extraction_notes = _build_content(uploaded_files)
+        content, fallback_files, extraction_notes, total_pages = _build_content(uploaded_files)
 
         batch = client.messages.batches.create(
             requests=[
@@ -192,6 +205,7 @@ def submit_batch(uploaded_files: list, user_email: str = None) -> dict:
             "extraction_notes": extraction_notes,
             "error":            None,
             "user_email":       user_email,
+            "total_pages":      total_pages,
         }
 
     except Exception:
@@ -206,7 +220,14 @@ def submit_batch(uploaded_files: list, user_email: str = None) -> dict:
 
 # ── Poll ──────────────────────────────────────────────────────────────────────
 
-def poll_until_done(batch_id: str, file_count: int, user_email: str = None):
+def poll_until_done(
+    batch_id: str,
+    file_count: int,
+    user_email: str = None,
+    total_pages: int = None,
+    credit_job_id: str = None,
+    upload_dup_warnings: list = None,
+):
     """
     Background daemon thread.
     Polls batch status — writes ONLY to log/status files, never session_state.
@@ -230,7 +251,28 @@ def poll_until_done(batch_id: str, file_count: int, user_email: str = None):
 
             if batch.processing_status == "ended":
                 write_log(batch_id, "Batch ended — retrieving results...")
-                result = retrieve_results(batch_id, file_count, client, user_email=user_email)
+                result = retrieve_results(
+                    batch_id,
+                    file_count,
+                    client,
+                    user_email=user_email,
+                    total_pages=total_pages,
+                    upload_dup_warnings=upload_dup_warnings,
+                )
+
+                if credit_job_id:
+                    if result["success"]:
+                        credit_result = finalize_credit_reservation(credit_job_id)
+                        result["credit_finalized"] = credit_result["success"]
+                        result["credit_error"] = None if credit_result["success"] else credit_result.get("error")
+                    else:
+                        credit_result = refund_credit_reservation(
+                            credit_job_id,
+                            reason=result.get("error") or "Batch processing failed",
+                        )
+                        result["credit_refunded"] = credit_result["success"]
+                        result["credit_error"] = None if credit_result["success"] else credit_result.get("error")
+
                 write_status(batch_id, result)
 
                 if result["success"]:
@@ -250,10 +292,17 @@ def poll_until_done(batch_id: str, file_count: int, user_email: str = None):
         time.sleep(config.POLL_INTERVAL_SECONDS)
 
 
-def start_polling_thread(batch_id: str, file_count: int, user_email: str = None) -> threading.Thread:
+def start_polling_thread(
+    batch_id: str,
+    file_count: int,
+    user_email: str = None,
+    total_pages: int = None,
+    credit_job_id: str = None,
+    upload_dup_warnings: list = None,
+) -> threading.Thread:
     t = threading.Thread(
         target=poll_until_done,
-        args=(batch_id, file_count, user_email),
+        args=(batch_id, file_count, user_email, total_pages, credit_job_id, upload_dup_warnings),
         daemon=True,
     )
     t.start()
@@ -262,7 +311,14 @@ def start_polling_thread(batch_id: str, file_count: int, user_email: str = None)
 
 # ── Retrieve results ──────────────────────────────────────────────────────────
 
-def retrieve_results(batch_id: str, file_count: int, client=None, user_email: str = None) -> dict:
+def retrieve_results(
+    batch_id: str,
+    file_count: int,
+    client=None,
+    user_email: str = None,
+    total_pages: int = None,
+    upload_dup_warnings: list = None,
+) -> dict:
     if client is None:
         client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
 
@@ -305,12 +361,13 @@ def retrieve_results(batch_id: str, file_count: int, client=None, user_email: st
                 errors.append(err)
                 write_log(batch_id, f"ERROR: {err}")
 
-        if not all_items and errors:
+        if not all_items:
             return {
                 "success": False, "items": [], "cost": None,
                 "realtime_cost": None, "dup_warnings": [],
                 "email_sent": False, "email_error": None,
-                "error": "\n".join(errors),
+                "error": "\n".join(errors) if errors else "No invoice line items were extracted.",
+                "total_pages": total_pages or file_count,
             }
 
         # Deduplicate by invoice number
@@ -354,6 +411,7 @@ def retrieve_results(batch_id: str, file_count: int, client=None, user_email: st
             item_count        = len(all_items),
             user_email        = user_email,
             dup_warnings      = dup_warnings or None,
+            upload_dup_warnings = upload_dup_warnings or None,
             realtime_cost     = realtime_cost,
             batch_id          = batch_id,
             tally_erp9_bytes  = tally_erp9_bytes,
@@ -370,11 +428,13 @@ def retrieve_results(batch_id: str, file_count: int, client=None, user_email: st
             "cost":               batch_cost,
             "realtime_cost":      realtime_cost,
             "dup_warnings":       dup_warnings,
+            "upload_dup_warnings": upload_dup_warnings or [],
             "email_sent":         email_ok,
             "email_error":        None if email_ok else email_result,
             "error":              "\n".join(errors) if errors else None,
             "tally_erp9_bytes":   tally_erp9_bytes,
             "tally_prime_bytes":  tally_prime_bytes,
+            "total_pages":        total_pages or file_count,
         }
 
     except Exception:
@@ -384,4 +444,5 @@ def retrieve_results(batch_id: str, file_count: int, client=None, user_email: st
             "success": False, "items": [], "cost": None,
             "realtime_cost": None, "dup_warnings": [],
             "email_sent": False, "email_error": None, "error": err,
+            "total_pages": total_pages or file_count,
         }
