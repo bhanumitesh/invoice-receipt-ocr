@@ -5,6 +5,7 @@
 
 import secrets
 import string
+import threading
 import traceback
 from datetime import datetime, timedelta, timezone
 
@@ -51,15 +52,24 @@ def send_otp_email(email: str, otp: str) -> dict:
         return {"success": False, "error": traceback.format_exc()}
 
 
+def _send_otp_email_background(email: str, otp: str):
+    def _worker():
+        result = send_otp_email(email, otp)
+        if not result["success"]:
+            print(f"[OTP EMAIL FAILED] {email}: {result.get('error')}")
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
 def request_otp(email: str) -> dict:
     """
-    Full OTP request flow:
+    OTP request flow:
       1. Check email is registered
       2. Check account is active
       3. Check credits > 0
       4. Generate OTP
       5. Save to DB
-      6. Send via email
+      6. Send email in a background thread
 
     Returns:
         {
@@ -110,19 +120,13 @@ def request_otp(email: str) -> dict:
             "message": "Failed to generate OTP. Please try again.",
         }
 
-    # ── Send OTP email ──
-    result = send_otp_email(email, otp)
-    if not result["success"]:
-        return {
-            "success": False,
-            "blocked": False,
-            "message": "Failed to send OTP email. Please try again.",
-        }
+    # ── Send OTP email asynchronously so the UI can move to OTP entry quickly ──
+    _send_otp_email_background(email, otp)
 
     return {
         "success": True,
         "blocked": False,
-        "message": f"OTP sent to {email}. Valid for {config.OTP_EXPIRY_MINUTES} minutes.",
+        "message": f"OTP is being sent to {email}. Valid for {config.OTP_EXPIRY_MINUTES} minutes.",
         "credits": credits,
     }
 

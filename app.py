@@ -73,6 +73,8 @@ auth_defaults = {
     "user_credits": 0,
     "otp_sent":     False,
     "otp_email":    "",
+    "otp_request_pending": False,
+    "otp_verify_pending": False,
     "process_requested": False,
 }
 
@@ -190,6 +192,14 @@ def _refund_credit_reservation(job_id: str, reason: str):
 _restore_persisted_session()
 
 
+def _request_otp_action():
+    st.session_state["otp_request_pending"] = True
+
+
+def _verify_otp_action():
+    st.session_state["otp_verify_pending"] = True
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  AUTH GATE
 # ══════════════════════════════════════════════════════════════════════════════
@@ -209,13 +219,23 @@ if not st.session_state["logged_in"]:
             key         = "login_email_input",
         )
 
-        if st.button("Send OTP", type="primary", use_container_width=True):
+        st.button(
+            "Send OTP",
+            type="primary",
+            use_container_width=True,
+            disabled=st.session_state["otp_request_pending"],
+            on_click=_request_otp_action,
+        )
+
+        if st.session_state["otp_request_pending"]:
             if not email_input or "@" not in email_input:
+                st.session_state["otp_request_pending"] = False
                 st.error("Please enter a valid email address.")
             else:
-                with st.spinner("Sending OTP..."):
+                with st.spinner("Preparing OTP..."):
                     result = request_otp(email_input.strip())
 
+                st.session_state["otp_request_pending"] = False
                 if result["success"]:
                     st.session_state["otp_sent"]  = True
                     st.session_state["otp_email"] = email_input.strip().lower()
@@ -244,8 +264,17 @@ if not st.session_state["logged_in"]:
 
         col1, col2 = st.columns(2)
         with col1:
-            if st.button("Verify OTP", type="primary", use_container_width=True):
+            st.button(
+                "Verify OTP",
+                type="primary",
+                use_container_width=True,
+                disabled=st.session_state["otp_verify_pending"],
+                on_click=_verify_otp_action,
+            )
+
+            if st.session_state["otp_verify_pending"]:
                 if not otp_input or len(otp_input.strip()) != 6:
+                    st.session_state["otp_verify_pending"] = False
                     st.error("Please enter the 6-digit OTP.")
                 else:
                     with st.spinner("Verifying..."):
@@ -253,6 +282,7 @@ if not st.session_state["logged_in"]:
                             st.session_state["otp_email"],
                             otp_input.strip(),
                         )
+                    st.session_state["otp_verify_pending"] = False
                     if result["success"]:
                         user_email_for_session = st.session_state["otp_email"]
                         session = create_session(user_email_for_session)
@@ -270,9 +300,11 @@ if not st.session_state["logged_in"]:
                         st.error(f"❌ {result['message']}")
 
         with col2:
-            if st.button("← Use different email", use_container_width=True):
+            if st.button("← Use different email", use_container_width=True, disabled=st.session_state["otp_verify_pending"]):
                 st.session_state["otp_sent"]  = False
                 st.session_state["otp_email"] = ""
+                st.session_state["otp_request_pending"] = False
+                st.session_state["otp_verify_pending"] = False
                 st.rerun()
 
     st.stop()
