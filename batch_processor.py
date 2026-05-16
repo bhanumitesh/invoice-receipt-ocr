@@ -361,7 +361,7 @@ def retrieve_results(batch_id: str, file_count: int, client=None, user_email: st
         )
         write_log(
             batch_id,
-            f"Email: {'sent to ' + config.RECIPIENT_EMAIL if email_ok else 'FAILED — ' + str(email_result)}"
+            f"Email: {'email sent ' if email_ok else 'FAILED — ' + str(email_result)}"
         )
 
         return {
