@@ -94,76 +94,80 @@ def cleanup_batch_files(batch_id: str):
 
 
 # ── Build content blocks (shared by submit) ───────────────────────────────────
+#
+#  One Claude request is built PER FILE (not one combined request for the whole
+#  upload). Each response then only has to contain that file's own line items,
+#  which keeps it well under MAX_TOKENS and stops one dense invoice — or a big
+#  batch of files — from truncating and losing the whole job's output. The
+#  Batch API accepts many requests in a single batch, and retrieve_results()
+#  already aggregates results per-request, so this only changes submission.
 
-def _build_content(uploaded_files: list, batch_id: str = None) -> tuple:
+def _build_file_content(f, batch_id: str = None) -> dict:
     """
-    Builds Claude content blocks from uploaded files.
+    Builds Claude content blocks for a single uploaded file.
     Uses text extraction where possible; falls back to PDF binary for scanned files.
 
-    Returns: (content_blocks, fallback_files, extraction_notes)
+    Returns: {"content": [...], "page_count": int, "fallback": bool, "notes": [str]}
     """
-    content          = []
-    fallback_files   = []
-    extraction_notes = []
-    total_pages      = 0
+    extraction = extract_text_from_pdf(f)
+    page_count = extraction.get("page_count", 1) or 1
+    content    = []
+    notes      = []
+    fallback   = False
 
-    for f in uploaded_files:
-        extraction = extract_text_from_pdf(f)
-        total_pages += extraction.get("page_count", 1) or 1
+    if extraction["success"] and not extraction["use_fallback"]:
+        if extraction["skipped_pages"] > 0:
+            notes.append(f"{extraction['skipped_pages']} duplicate page(s) skipped")
+        if extraction["scanned_pages"] > 0:
+            notes.append(f"{extraction['scanned_pages']} scanned page(s) skipped")
 
-        if extraction["success"] and not extraction["use_fallback"]:
-            notes = []
-            if extraction["skipped_pages"] > 0:
-                notes.append(f"{extraction['skipped_pages']} duplicate page(s) skipped")
-            if extraction["scanned_pages"] > 0:
-                notes.append(f"{extraction['scanned_pages']} scanned page(s) skipped")
+        header = f"=== FILE: {f.name} ==="
+        if notes:
+            header += f" [{', '.join(notes)}]"
 
-            header = f"=== FILE: {f.name} ==="
-            if notes:
-                header += f" [{', '.join(notes)}]"
+        content.append({
+            "type": "text",
+            "text": header + "\n\n" + extraction["text"],
+        })
 
-            content.append({
-                "type": "text",
-                "text": header + "\n\n" + extraction["text"],
-            })
-            if notes:
-                extraction_notes.append(f"{f.name}: {', '.join(notes)}")
-
-            if batch_id:
-                write_log(batch_id, f"{f.name} → text extraction "
-                          f"({extraction['page_count']} pages"
-                          + (f", {extraction['skipped_pages']} dup pages skipped" if extraction['skipped_pages'] else "")
-                          + ")")
-        else:
-            f.seek(0)
-            pdf_bytes = f.read()
-            b64_data  = base64.standard_b64encode(pdf_bytes).decode("utf-8")
-            content.append({
-                "type": "document",
-                "source": {
-                    "type":       "base64",
-                    "media_type": "application/pdf",
-                    "data":       b64_data,
-                },
-                "title": f.name,
-            })
-            fallback_files.append(f.name)
-            if batch_id:
-                write_log(batch_id, f"{f.name} → PDF fallback (scanned/image-based)")
+        if batch_id:
+            write_log(batch_id, f"{f.name} → text extraction "
+                      f"({page_count} pages"
+                      + (f", {extraction['skipped_pages']} dup pages skipped" if extraction['skipped_pages'] else "")
+                      + ")")
+    else:
+        f.seek(0)
+        pdf_bytes = f.read()
+        b64_data  = base64.standard_b64encode(pdf_bytes).decode("utf-8")
+        content.append({
+            "type": "document",
+            "source": {
+                "type":       "base64",
+                "media_type": "application/pdf",
+                "data":       b64_data,
+            },
+            "title": f.name,
+        })
+        fallback = True
+        if batch_id:
+            write_log(batch_id, f"{f.name} → PDF fallback (scanned/image-based)")
 
     content.append({
         "type": "text",
         "text": config.EXTRACTION_PROMPT,
     })
 
-    return content, fallback_files, extraction_notes, total_pages
+    return {"content": content, "page_count": page_count, "fallback": fallback, "notes": notes}
 
 
 # ── Submit ────────────────────────────────────────────────────────────────────
 
 def submit_batch(uploaded_files: list, user_email: str = None) -> dict:
     """
-    Submits all uploaded PDFs as a single Batch API job.
+    Submits one Batch API request per uploaded PDF, all inside a single batch job.
+    Keeping requests per-file (rather than one combined request for every file)
+    keeps each response well under MAX_TOKENS and stops one file from truncating
+    the whole job's output.
 
     Returns:
         dict: success, batch_id, fallback_files, extraction_notes, error, user_email
@@ -173,24 +177,34 @@ def submit_batch(uploaded_files: list, user_email: str = None) -> dict:
 
     try:
         # Build content — no batch_id yet so no log writes during build
-        content, fallback_files, extraction_notes, total_pages = _build_content(uploaded_files)
+        ts               = datetime.now().strftime('%Y%m%d_%H%M%S')
+        requests         = []
+        fallback_files   = []
+        extraction_notes = []
+        total_pages      = 0
 
-        batch = client.messages.batches.create(
-            requests=[
-                {
-                    "custom_id": f"invoice_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-                    "params": {
-                        "model":      config.MODEL,
-                        "max_tokens": config.MAX_TOKENS,
-                        "messages":   [{"role": "user", "content": content}],
-                    },
-                }
-            ]
-        )
+        for idx, f in enumerate(uploaded_files, 1):
+            built = _build_file_content(f)
+            total_pages += built["page_count"]
+            if built["fallback"]:
+                fallback_files.append(f.name)
+            if built["notes"]:
+                extraction_notes.append(f"{f.name}: {', '.join(built['notes'])}")
+
+            requests.append({
+                "custom_id": f"invoice_run_{ts}_{idx}",
+                "params": {
+                    "model":      config.MODEL,
+                    "max_tokens": config.MAX_TOKENS,
+                    "messages":   [{"role": "user", "content": built["content"]}],
+                },
+            })
+
+        batch = client.messages.batches.create(requests=requests)
         batch_id = batch.id
 
         # Write initial log now that we have a batch_id
-        write_log(batch_id, f"Batch submitted | files: {len(uploaded_files)}")
+        write_log(batch_id, f"Batch submitted | files: {len(uploaded_files)} | requests: {len(requests)}")
         if fallback_files:
             write_log(batch_id, f"PDF fallback used for: {', '.join(fallback_files)}")
         if extraction_notes:

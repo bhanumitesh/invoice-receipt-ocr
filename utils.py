@@ -422,6 +422,9 @@ FIELD_KEYS = [
 
 COL_WIDTHS = [6, 30, 22, 22, 13, 46, 6, 14, 15, 12, 12, 12, 11, 14]
 
+# Columns written as real numbers (not text) so Excel can sum/average them.
+AMOUNT_FIELD_KEYS = {"rate", "taxable_value", "cgst", "sgst", "igst", "total_value"}
+
 
 def create_excel(items: list, dup_warnings: list = None) -> bytes:
     """
@@ -457,7 +460,25 @@ def create_excel(items: list, dup_warnings: list = None) -> bytes:
         fill = alt_fill if r_idx % 2 == 0 else white_fill
         for c_idx, key in enumerate(FIELD_KEYS, 1):
             val  = item.get(key, "")
-            cell = ws.cell(row=r_idx, column=c_idx, value=str(val) if val else "")
+            cell = ws.cell(row=r_idx, column=c_idx)
+
+            if key == "sr_no":
+                num = _parse_amount_or_none(val)
+                cell.value = int(num) if num is not None else (str(val) if val else "")
+            elif key in AMOUNT_FIELD_KEYS:
+                # Write as a real number (not text) so Excel's status bar can
+                # sum/average the column — the currency symbol Claude returned
+                # is kept via number_format instead of being embedded in the text.
+                num = _parse_amount_or_none(val)
+                if num is not None:
+                    cell.value = num
+                    symbol = _detect_currency_symbol(val) or "₹"
+                    cell.number_format = f'"{symbol}"#,##0.00'
+                else:
+                    cell.value = str(val) if val else ""
+            else:
+                cell.value = str(val) if val else ""
+
             cell.font      = Font(name="Arial", size=9)
             cell.fill      = fill
             cell.border    = border
@@ -487,24 +508,48 @@ def create_excel(items: list, dup_warnings: list = None) -> bytes:
 
 
 
-# ── Tally XML generation ──────────────────────────────────────────────────────
+# ── Amount parsing (shared by Excel numeric cells + Tally XML) ────────────────
+
+CURRENCY_SYMBOLS = ["₹", "Rs.", "Rs", "$", "€", "£"]
+
+
+def _detect_currency_symbol(val) -> str:
+    """Returns the first currency symbol found in val, or "" if none."""
+    s = str(val or "")
+    for ch in CURRENCY_SYMBOLS:
+        if ch in s:
+            return ch
+    return ""
+
+
+def _parse_amount_or_none(val):
+    """
+    Same stripping as _parse_amount, but returns None (not 0.0) when the value
+    is missing or genuinely non-numeric — lets callers tell "no data" apart
+    from a real zero, instead of collapsing both to 0.0.
+    """
+    if val is None or str(val).strip() == "":
+        return None
+    s = str(val)
+    for ch in CURRENCY_SYMBOLS + [",", " "]:
+        s = s.replace(ch, "")
+    s = s.strip()
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
 
 def _parse_amount(val) -> float:
     """
     Safely extracts a float from a value that may be a string like "Rs.1,234.56"
     or "₹1,234.56" or just "1234.56". Returns 0.0 if unparseable.
     """
-    if val is None or val == "":
-        return 0.0
-    s = str(val)
-    # Remove currency symbols and whitespace
-    for ch in ["₹", "Rs.", "Rs", "$", "€", "£", ",", " "]:
-        s = s.replace(ch, "")
-    s = s.strip()
-    try:
-        return float(s)
-    except ValueError:
-        return 0.0
+    num = _parse_amount_or_none(val)
+    return num if num is not None else 0.0
+
+
+# ── Tally XML generation ──────────────────────────────────────────────────────
 
 
 def _tally_date(date_str: str) -> str:
