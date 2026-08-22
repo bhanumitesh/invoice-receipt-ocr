@@ -133,7 +133,11 @@ def detect_duplicate_uploads(uploaded_files: list) -> dict:
     identities = []
 
     for f in uploaded_files or []:
-        extraction = extract_text_from_pdf(f)
+        # light=True: this is just an identity precheck (GSTIN + invoice no.
+        # from native text) — no need to render/OCR pages with no text layer,
+        # and Streamlit's rerun model means this can run several times per
+        # user action, so the cheap path matters here more than elsewhere.
+        extraction = extract_text_from_pdf(f, light=True)
         identity = extract_invoice_identity_from_text(extraction.get("text", "")) if extraction.get("success") else {
             "gstin": "",
             "invoice_no": "",
@@ -249,7 +253,7 @@ def _encode_page_jpeg(pil_image) -> bytes:
 
 # ── PDF text extraction ───────────────────────────────────────────────────────
 
-def extract_text_from_pdf(file) -> dict:
+def extract_text_from_pdf(file, light: bool = False) -> dict:
     """
     Attempts to extract text from a PDF file using pdfplumber, per page:
 
@@ -261,6 +265,14 @@ def extract_text_from_pdf(file) -> dict:
            page image to send to Claude directly instead of guessing locally.
 
     Exact duplicate pages (by content hash) are skipped either way.
+
+    light: when True, skips step 2 entirely for pages with no native text —
+    no rendering, no annotation check, no OCR, no fallback image. Pages
+    without a text layer are just counted as scanned. Use this for anything
+    that only needs native text (e.g. the upload-time duplicate-identity
+    precheck) — rendering every page to an image is real CPU cost that isn't
+    needed there, and Streamlit's rerun-the-whole-script-on-every-interaction
+    model means a caller like that can run many times per user action.
 
     Returns:
         {
@@ -307,6 +319,10 @@ def extract_text_from_pdf(file) -> dict:
 
                 # ── No native text layer — try local OCR, else keep as an image ──
                 if len(combined) < config.MIN_PAGE_TEXT_CHARS:
+                    if light:
+                        scanned_pages += 1
+                        continue
+
                     page_image = page.to_image(
                         resolution=config.OCR_RENDER_RESOLUTION_DPI
                     ).original
