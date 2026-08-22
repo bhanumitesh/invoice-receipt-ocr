@@ -42,7 +42,17 @@ PRICE_INPUT_PER_MTOK  = float(_optional("PRICE_INPUT_PER_MTOK",  "3.00"))
 PRICE_OUTPUT_PER_MTOK = float(_optional("PRICE_OUTPUT_PER_MTOK", "15.00"))
 
 # ── API output settings ────────────────────────────────────────────────────
-MAX_TOKENS = int(_optional("MAX_TOKENS", "8192"))
+# MAX_TOKENS       : used by the real-time (synchronous Messages API) path.
+#                     Sonnet 4.6's standard sync cap is 128,000 — keep this at
+#                     or below that.
+# BATCH_MAX_TOKENS : used by the Batch API path, which submits the
+#                     `output-300k-2026-03-24` beta header (see
+#                     batch_processor.py) to raise the per-request cap to
+#                     300,000 — far larger than any single invoice needs, so a
+#                     lower default keeps typical jobs fast. Raise via env var
+#                     if a single very dense invoice still truncates.
+MAX_TOKENS       = int(_optional("MAX_TOKENS", "8192"))
+BATCH_MAX_TOKENS = int(_optional("BATCH_MAX_TOKENS", "32000"))
 
 # ── Email / Resend (required) ──────────────────────────────────────────────
 # Sign up free at resend.com — 3,000 emails/month permanently free

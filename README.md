@@ -55,7 +55,8 @@ cp .env.example .env
 | Variable | Default | Description |
 |---|---|---|
 | `ANTHROPIC_MODEL` | `claude-sonnet-4-6` | Claude model to use |
-| `MAX_TOKENS` | `8192` | Max output tokens per API call |
+| `MAX_TOKENS` | `8192` | Max output tokens for real-time (synchronous) API calls |
+| `BATCH_MAX_TOKENS` | `32000` | Max output tokens per file for Batch API calls — submitted with the `output-300k-2026-03-24` beta header, so this can go up to `300000` if a single invoice has an unusually large number of line items |
 | `PRICE_INPUT_PER_MTOK` | `3.00` | Input token price (USD per million) |
 | `PRICE_OUTPUT_PER_MTOK` | `15.00` | Output token price (USD per million) |
 | `POLL_INTERVAL_SECONDS` | `120` | How often to check batch status (seconds) |

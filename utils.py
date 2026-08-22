@@ -346,11 +346,15 @@ def format_cost_summary(cost: dict, mode: str, realtime_cost: dict = None) -> st
 
 # ── JSON parsing ──────────────────────────────────────────────────────────────
 
-def parse_json_response(raw_text: str) -> list:
+def parse_json_response(raw_text: str, token_limit: int = None) -> list:
     """
     Parses the abbreviated JSON array returned by Claude.
     Expands abbreviated keys to full names for use in Excel.
     Strips markdown fences if present.
+
+    token_limit: the max_tokens value actually used for this request, for the
+    truncation error message — defaults to config.MAX_TOKENS (real-time path);
+    the batch path passes config.BATCH_MAX_TOKENS since it uses a higher cap.
     """
     # Abbreviated key → full key mapping
     KEY_MAP = {
@@ -399,8 +403,9 @@ def parse_json_response(raw_text: str) -> list:
             or text.count("{") != text.count("}")
         )
         if truncated:
+            limit = token_limit if token_limit is not None else config.MAX_TOKENS
             raise ValueError(
-                f"Output truncated — Claude hit the max_tokens limit ({config.MAX_TOKENS} tokens). "
+                f"Output truncated — Claude hit the max_tokens limit ({limit} tokens). "
                 f"The JSON was cut off mid-response. Try splitting your files into smaller batches."
             )
         raise ValueError(f"JSON parse error: {e}\n\nRaw text:\n{text[:500]}")

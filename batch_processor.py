@@ -195,12 +195,18 @@ def submit_batch(uploaded_files: list, user_email: str = None) -> dict:
                 "custom_id": f"invoice_run_{ts}_{idx}",
                 "params": {
                     "model":      config.MODEL,
-                    "max_tokens": config.MAX_TOKENS,
+                    "max_tokens": config.BATCH_MAX_TOKENS,
                     "messages":   [{"role": "user", "content": built["content"]}],
                 },
             })
 
-        batch = client.messages.batches.create(requests=requests)
+        # The output-300k beta raises the per-request max_tokens cap on the
+        # Batch API (Sonnet 4.6 and others) from the standard 128k up to
+        # 300k — retrieval doesn't need the beta header, only submission does.
+        batch = client.beta.messages.batches.create(
+            betas=["output-300k-2026-03-24"],
+            requests=requests,
+        )
         batch_id = batch.id
 
         # Write initial log now that we have a batch_id
@@ -354,15 +360,16 @@ def retrieve_results(
                 if stop_reason == "max_tokens":
                     err = (
                         f"Output truncated for {result.custom_id} — Claude hit the "
-                        f"max_tokens limit ({config.MAX_TOKENS}). "
-                        f"Try submitting fewer files per batch."
+                        f"max_tokens limit ({config.BATCH_MAX_TOKENS}) for this single file. "
+                        f"Raise BATCH_MAX_TOKENS (up to 300000) if this file has an "
+                        f"unusually large number of line items."
                     )
                     errors.append(err)
                     write_log(batch_id, f"WARNING: {err}")
                     continue
 
                 try:
-                    items = parse_json_response(raw_text)
+                    items = parse_json_response(raw_text, token_limit=config.BATCH_MAX_TOKENS)
                     all_items.extend(items)
                     write_log(batch_id, f"Parsed {len(items)} items from {result.custom_id}")
                 except ValueError as e:
