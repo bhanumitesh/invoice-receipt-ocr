@@ -3,9 +3,19 @@
 #
 #  Thread safety:
 #    Background thread NEVER touches st.session_state.
-#    All communication to UI is via two files in batch_logs/:
-#      batch_<id>.log    → append-only human-readable log
-#      batch_<id>.status → JSON written once when done; app.py polls this
+#    All communication to UI is via files in batch_logs/:
+#      batch_<id>.log     → append-only human-readable log
+#      batch_<id>.status  → JSON written once when batch processing ends; app.py polls this
+#      submit_<job>.status → JSON written once submission itself finishes; app.py polls this
+#
+#  Submission runs in a background thread (start_submission_thread) rather
+#  than blocking the main Streamlit script, for the same reason polling does:
+#  it does real CPU-bound local work (rendering scanned pages, encoding
+#  images) that can take a while on CPU-constrained hosts. Running it
+#  synchronously ties up Streamlit's single worker long enough that the
+#  worker stops responding to the frontend's own keep-alive requests, so the
+#  browser shows a "Connection error" — regardless of whether submission
+#  itself would have succeeded.
 # ─────────────────────────────────────────────
 
 import json
@@ -92,6 +102,41 @@ def cleanup_batch_files(batch_id: str):
             pass
 
 
+# ── Submission status file helpers ─────────────────────────────────────────────
+#
+#  Keyed by credit_job_id (generated before submission starts, unlike
+#  batch_id which only exists once Anthropic has actually created the
+#  batch) — this is what lets app.py poll for "has submission itself
+#  finished" the same way it already polls for "has the batch finished".
+
+def _submit_status_path(job_id: str) -> Path: return LOG_DIR / f"submit_{job_id}.status"
+
+
+def write_submit_status(job_id: str, result: dict):
+    with open(_submit_status_path(job_id), "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2, default=str)
+
+
+def read_submit_status(job_id: str) -> dict:
+    path = _submit_status_path(job_id)
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def cleanup_submit_status(job_id: str):
+    path = _submit_status_path(job_id)
+    try:
+        if path.exists():
+            path.unlink()
+    except Exception:
+        pass
+
+
 # ── Submit ────────────────────────────────────────────────────────────────────
 
 def submit_batch(uploaded_files: list, user_email: str = None) -> dict:
@@ -169,6 +214,29 @@ def submit_batch(uploaded_files: list, user_email: str = None) -> dict:
             "extraction_notes": [],
             "error":            traceback.format_exc(),
         }
+
+
+def _submit_batch_worker(job_id: str, uploaded_files: list, user_email: str = None):
+    """Background thread target — runs submit_batch() and writes the result
+    to a submit_<job_id>.status file for app.py to poll."""
+    result = submit_batch(uploaded_files, user_email=user_email)
+    write_submit_status(job_id, result)
+
+
+def start_submission_thread(job_id: str, uploaded_files: list, user_email: str = None) -> threading.Thread:
+    """
+    Runs submit_batch() in a background thread instead of the main script.
+    See the module docstring for why this matters — submission does the same
+    kind of CPU-bound local work (page rendering, image encoding) that
+    poll_until_done() already avoids running synchronously.
+    """
+    t = threading.Thread(
+        target=_submit_batch_worker,
+        args=(job_id, uploaded_files, user_email),
+        daemon=True,
+    )
+    t.start()
+    return t
 
 
 # ── Poll ──────────────────────────────────────────────────────────────────────

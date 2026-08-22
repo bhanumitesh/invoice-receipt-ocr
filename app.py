@@ -22,9 +22,11 @@ import config
 from auth import request_otp, validate_otp
 from batch_processor import (
     cleanup_batch_files,
+    cleanup_submit_status,
     read_status,
+    read_submit_status,
     start_polling_thread,
-    submit_batch,
+    start_submission_thread,
 )
 from db import (
     create_session,
@@ -79,12 +81,14 @@ auth_defaults = {
 }
 
 batch_defaults = {
-    "batch_id":          None,
-    "batch_submitted":   False,
-    "file_count":        0,
-    "batch_total_pages": 0,
-    "credit_job_id":     None,
-    "processing":        False,
+    "batch_id":                    None,
+    "batch_submitted":             False,
+    "submission_started":          False,
+    "file_count":                  0,
+    "batch_total_pages":           0,
+    "credit_job_id":               None,
+    "pending_upload_dup_warnings": None,
+    "processing":                  False,
 }
 
 for k, v in {**auth_defaults, **batch_defaults}.items():
@@ -608,10 +612,23 @@ if process_requested and not is_batch:
 # ══════════════════════════════════════════════════════════════════════════════
 #  BATCH FLOW — SUBMIT
 # ══════════════════════════════════════════════════════════════════════════════
+#
+#  Submission runs in a background thread (start_submission_thread), not
+#  inline here. submit_batch() does real CPU-bound local work — rendering
+#  scanned pages, encoding images — that can take a while on CPU-constrained
+#  hosts. Running it synchronously ties up Streamlit's single worker long
+#  enough that it stops responding to the frontend's own keep-alive checks,
+#  so the browser shows a "Connection error" regardless of whether
+#  submission itself would have succeeded. Polling this way (short reruns,
+#  matching the existing pattern just below for batch *processing* status)
+#  keeps each rerun brief instead of one long blocking call.
 
-if process_requested and is_batch and not st.session_state["batch_submitted"]:
-
-    st.session_state["batch_submitted"] = True
+if (
+    process_requested
+    and is_batch
+    and not st.session_state["batch_submitted"]
+    and not st.session_state["submission_started"]
+):
     credit_job_id = f"batch_{uuid.uuid4().hex}"
     total_pages_for_reservation = selected_total_pages or len(processing_files)
 
@@ -622,37 +639,68 @@ if process_requested and is_batch and not st.session_state["batch_submitted"]:
     )
 
     if reservation["success"]:
-        with st.spinner("📤 Submitting batch job..."):
-            sub = submit_batch(processing_files, user_email=user_email)
+        st.session_state["submission_started"]          = True
+        st.session_state["credit_job_id"]                = credit_job_id
+        st.session_state["file_count"]                   = len(processing_files)
+        st.session_state["batch_total_pages"]            = total_pages_for_reservation
+        st.session_state["pending_upload_dup_warnings"]  = duplicate_upload_warnings or None
+        start_submission_thread(credit_job_id, processing_files, user_email=user_email)
+        st.rerun()
+    else:
+        st.session_state["processing"] = False
+        st.session_state["process_requested"] = False
 
-        if sub["success"]:
-            st.session_state["batch_id"]          = sub["batch_id"]
-            st.session_state["file_count"]        = len(processing_files)
-            st.session_state["batch_total_pages"] = sub.get("total_pages") or total_pages_for_reservation
-            st.session_state["credit_job_id"]     = credit_job_id
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  BATCH FLOW — WAITING FOR SUBMISSION (background thread)
+# ══════════════════════════════════════════════════════════════════════════════
+
+if st.session_state["submission_started"] and not st.session_state["batch_submitted"]:
+
+    credit_job_id = st.session_state["credit_job_id"]
+
+    st.divider()
+    st.info(
+        "📤 **Submitting batch job...** Running in the background — "
+        "this page stays responsive while it works."
+    )
+
+    submit_status = read_submit_status(credit_job_id)
+
+    if submit_status is None:
+        time.sleep(3)
+        st.rerun()
+
+    else:
+        cleanup_submit_status(credit_job_id)
+
+        if submit_status["success"]:
+            st.session_state["batch_id"]           = submit_status["batch_id"]
+            st.session_state["batch_submitted"]    = True
+            st.session_state["submission_started"] = False
+            st.session_state["batch_total_pages"]  = (
+                submit_status.get("total_pages") or st.session_state["batch_total_pages"]
+            )
             st.session_state["processing"]        = False
             st.session_state["process_requested"] = False
             start_polling_thread(
-                sub["batch_id"],
-                len(processing_files),
+                submit_status["batch_id"],
+                st.session_state["file_count"],
                 user_email=user_email,
                 total_pages=st.session_state["batch_total_pages"],
                 credit_job_id=credit_job_id,
-                upload_dup_warnings=duplicate_upload_warnings or None,
+                upload_dup_warnings=st.session_state.get("pending_upload_dup_warnings"),
             )
+            st.rerun()
         else:
             _refund_credit_reservation(
                 credit_job_id,
-                reason=sub.get("error") or "Batch submission failed",
+                reason=submit_status.get("error") or "Batch submission failed",
             )
-            st.session_state["batch_submitted"] = False
-            st.session_state["processing"] = False
-            st.session_state["process_requested"] = False
-            st.error(f"❌ Submission failed:\n{sub['error']}")
-    else:
-        st.session_state["batch_submitted"] = False
-        st.session_state["processing"] = False
-        st.session_state["process_requested"] = False
+            st.session_state["submission_started"] = False
+            st.session_state["processing"]         = False
+            st.session_state["process_requested"]  = False
+            st.error(f"❌ Submission failed:\n{submit_status['error']}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
