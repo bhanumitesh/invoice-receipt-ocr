@@ -28,6 +28,21 @@ invoice_processor/
 pip install -r requirements.txt
 ```
 
+**Also required: the Tesseract OCR binary** (used for scanned pages with no
+text layer — see [PDF handling](#pdf-handling) below). `pytesseract` in
+`requirements.txt` is just a Python wrapper; the actual OCR engine must be
+installed separately on the host:
+- Local dev (macOS): `brew install tesseract`
+- Local dev (Debian/Ubuntu): `apt-get install tesseract-ocr`
+- Render: add `tesseract-ocr` via a system package (e.g. an `apt.txt` /
+  Aptfile-style buildpack, or a Docker-based deploy with `apt-get install
+  tesseract-ocr` in the build step) — check Render's current docs for
+  installing apt packages on your plan.
+
+If Tesseract isn't installed, the app still works correctly — it just always
+falls back to sending scanned pages to Claude as images instead of using
+local OCR (the pre-OCR behavior).
+
 ### 2. Environment variables
 
 All sensitive settings are read from environment variables — nothing is hardcoded.
@@ -61,7 +76,9 @@ cp .env.example .env
 | `PRICE_OUTPUT_PER_MTOK` | `15.00` | Output token price (USD per million) |
 | `POLL_INTERVAL_SECONDS` | `120` | How often to check batch status (seconds) |
 | `SKIP_DUPLICATE_INVOICE_NUMBERS` | `true` | Skip duplicate invoice numbers across files |
-| `MIN_PAGE_TEXT_CHARS` | `50` | Min chars to consider a page text-based (below = scanned fallback) |
+| `MIN_PAGE_TEXT_CHARS` | `50` | Min chars to consider a page text-based (below = try OCR, else image fallback) |
+| `HANDWRITING_INK_THRESHOLD` | `0.005` | Fraction of colored (non-black) ink pixels above which a page is treated as having handwriting/stamps and skips local OCR |
+| `OCR_RENDER_RESOLUTION_DPI` | `200` | Resolution used to render scanned pages, both for the local OCR attempt and as the image sent to Claude if OCR is skipped |
 | `TALLY_DEFAULT_LEDGER` | `Purchase Account` | Default ledger for all Tally XML imports — set to exact ledger name in your Tally company |
 | `TALLY_COMPANY_NAME` | `My Company` | Your company name exactly as it appears in Tally |
 
@@ -139,9 +156,13 @@ Every run produces three files:
 - Uploaded PDFs are page-counted before processing, so users see required credits upfront
 - Processing is blocked when selected PDF pages exceed available credits
 - Credits are reserved atomically when processing starts, finalized on extraction success, and refunded on extraction failure
-- **Text-based PDFs** (most invoices): text extracted via pdfplumber — cheaper, fewer tokens
-- **Scanned/image PDFs**: automatically detected and sent as PDF binary (fallback) — works but costs more
 - **Duplicate pages**: exact duplicate pages within a PDF are detected via MD5 hash and skipped
+- Per page, in order:
+  1. **Text-based pages** (most digitally-generated invoices): text extracted via pdfplumber — cheapest, most reliable
+  2. **Scanned pages with no handwriting/stamps**: read via local Tesseract OCR (free, no Claude cost) if Tesseract is installed on the host
+  3. **Scanned pages with handwriting or rubber stamps, or where OCR is unavailable/produced too little text**: sent to Claude as an image instead of guessing locally — costs more (image tokens), but local OCR has been observed to silently misread handwritten numbers without any low-confidence signal to catch it, which is too risky for financial figures
+- A file can mix all three per page — e.g. a mostly-clean scan with one stamped page only sends that one page as an image, not the whole file
+- Handwriting/stamp detection looks for colored (non-black) ink pixels above `HANDWRITING_INK_THRESHOLD` — pen and stamp ink is almost always blue/purple/red, unlike printed black text
 
 ---
 
@@ -173,7 +194,8 @@ app.py  (Streamlit UI)
     │       └── retrieve_results()  — downloads results, creates Excel + XML, sends email
     │
     └── utils.py  (shared)
-            ├── extract_text_from_pdf()  — pdfplumber extraction + dedup + fallback detection
+            ├── extract_text_from_pdf()  — pdfplumber extraction, per-page OCR/image routing, dedup
+            ├── build_file_content()     — builds Claude content blocks (text + image) for one file
             ├── parse_json_response()    — parses abbreviated JSON, expands keys, detects truncation
             ├── detect_duplicate_uploads() — skips high-confidence duplicate PDFs before Claude
             ├── deduplicate_items()      — fallback duplicate removal after extraction

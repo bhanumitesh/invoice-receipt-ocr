@@ -2,17 +2,16 @@
 #  realtime_processor.py  –  Real-time API processing
 # ─────────────────────────────────────────────
 
-import base64
 import traceback
 
 import anthropic
 
 import config
 from utils import (
+    build_file_content,
     calculate_cost,
     create_tally_xml,
     deduplicate_items,
-    extract_text_from_pdf,
     parse_json_response,
 )
 
@@ -21,9 +20,10 @@ def process_realtime(uploaded_files: list) -> dict:
     """
     Sends all uploaded PDFs to Claude in a single real-time API call.
 
-    For each file:
-      - Attempts text extraction via pdfplumber (cheaper, fewer tokens)
-      - Falls back to raw PDF binary if file is scanned/image-based
+    For each file, per page:
+      - Native text layer (cheapest) if present
+      - Else local OCR if the page has no handwriting/stamps (see build_file_content)
+      - Else sent to Claude as an image
 
     Returns:
         dict with keys:
@@ -31,7 +31,7 @@ def process_realtime(uploaded_files: list) -> dict:
             items        : list of extracted line item dicts
             cost         : cost dict
             dup_warnings : list of duplicate invoice warnings
-            fallback_files: list of filenames that used PDF fallback
+            fallback_files: list of filenames with at least one page sent as an image
             error        : str or None
     """
     client           = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
@@ -41,42 +41,13 @@ def process_realtime(uploaded_files: list) -> dict:
     total_pages      = 0   # for credit deduction — 1 credit per page
 
     for f in uploaded_files:
-        extraction = extract_text_from_pdf(f)
-        total_pages += extraction.get("page_count", 1)
-
-        if extraction["success"] and not extraction["use_fallback"]:
-            # ── Text extraction succeeded — send as text (fewer tokens) ──
-            notes = []
-            if extraction["skipped_pages"] > 0:
-                notes.append(f"{extraction['skipped_pages']} duplicate page(s) skipped")
-            if extraction["scanned_pages"] > 0:
-                notes.append(f"{extraction['scanned_pages']} scanned page(s) skipped")
-
-            header = f"=== FILE: {f.name} ==="
-            if notes:
-                header += f" [{', '.join(notes)}]"
-
-            content.append({
-                "type": "text",
-                "text": header + "\n\n" + extraction["text"],
-            })
-            if notes:
-                extraction_notes.append(f"{f.name}: {', '.join(notes)}")
-        else:
-            # ── Fallback — send raw PDF binary ──
-            f.seek(0)
-            pdf_bytes = f.read()
-            b64_data  = base64.standard_b64encode(pdf_bytes).decode("utf-8")
-            content.append({
-                "type": "document",
-                "source": {
-                    "type":       "base64",
-                    "media_type": "application/pdf",
-                    "data":       b64_data,
-                },
-                "title": f.name,
-            })
+        built = build_file_content(f)
+        total_pages += built["page_count"]
+        content.extend(built["content"])
+        if built["fallback_pages"] > 0:
             fallback_files.append(f.name)
+        if built["notes"]:
+            extraction_notes.extend(built["notes"])
 
     content.append({
         "type": "text",

@@ -17,6 +17,12 @@ import pdfplumber
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+from PIL import ImageChops
+
+try:
+    import pytesseract
+except ImportError:
+    pytesseract = None
 
 import config
 
@@ -164,40 +170,111 @@ def detect_duplicate_uploads(uploaded_files: list) -> dict:
     }
 
 
+# ── Local OCR (for pages with no native text layer) ───────────────────────────
+
+_ocr_availability_cache = None
+
+
+def _ocr_available() -> bool:
+    """
+    Checks, once, whether local Tesseract OCR can actually run (the Python
+    package alone isn't enough — the `tesseract` binary must be installed on
+    the host). Cached so this isn't re-checked on every page. If it's not
+    available, callers fall back to the pre-OCR behavior of always sending
+    scanned pages to Claude as images.
+    """
+    global _ocr_availability_cache
+    if _ocr_availability_cache is None:
+        if pytesseract is None:
+            _ocr_availability_cache = False
+        else:
+            try:
+                pytesseract.get_tesseract_version()
+                _ocr_availability_cache = True
+            except Exception:
+                _ocr_availability_cache = False
+    return _ocr_availability_cache
+
+
+def _page_has_annotation(pil_image, threshold: float = None) -> bool:
+    """
+    Detects handwriting/rubber-stamp ink on a page image.
+
+    Pen and stamp ink is almost always colored (blue/purple/red); printed
+    text is black or gray. Flags the page as annotated when the fraction of
+    colored, non-white pixels exceeds `threshold`
+    (config.HANDWRITING_INK_THRESHOLD by default).
+
+    Validated against real scans: clean printed pages measure ~0%, pages
+    with handwritten notes or stamps measure 4-8%+. Local OCR has been
+    observed to silently misread handwritten numbers (e.g. "9000" as "2000")
+    without a low-confidence signal to catch it, so annotated pages skip OCR
+    entirely and are sent to Claude as images instead.
+    """
+    threshold = config.HANDWRITING_INK_THRESHOLD if threshold is None else threshold
+    rgb = pil_image.convert("RGB")
+    if rgb.width == 0 or rgb.height == 0:
+        return False
+    hsv = rgb.convert("HSV")
+    _, s, v = hsv.split()
+    sat_mask         = s.point(lambda p: 255 if p > 30  else 0)
+    dark_enough_mask = v.point(lambda p: 255 if p < 240 else 0)
+    combined = ImageChops.multiply(sat_mask, dark_enough_mask)
+    colored_pixels = combined.histogram()[255]
+    return (colored_pixels / (rgb.width * rgb.height)) > threshold
+
+
+def _ocr_page_text(pil_image) -> str:
+    """Runs local Tesseract OCR on a page image. Returns "" on any failure."""
+    if not _ocr_available():
+        return ""
+    try:
+        return (pytesseract.image_to_string(pil_image) or "").strip()
+    except Exception:
+        return ""
+
+
 # ── PDF text extraction ───────────────────────────────────────────────────────
 
 def extract_text_from_pdf(file) -> dict:
     """
-    Attempts to extract text from a PDF file using pdfplumber.
+    Attempts to extract text from a PDF file using pdfplumber, per page:
 
-    For each page:
-      - Extracts raw text
-      - Extracts tables separately and appends as structured text
-      - Deduplicates exact duplicate pages using MD5 hash
-      - Flags scanned pages (text below MIN_PAGE_TEXT_CHARS threshold)
+      1. Native text layer (fastest, free, most reliable) — used if present.
+      2. No text layer: render the page and check for handwriting/stamps.
+         - Clean (no annotation) -> run local Tesseract OCR (free); use it if
+           it produced enough text.
+         - Annotated, or OCR still too sparse, or OCR unavailable -> keep the
+           page image to send to Claude directly instead of guessing locally.
+
+    Exact duplicate pages (by content hash) are skipped either way.
 
     Returns:
         {
-            "success":       bool   — True if enough text was extracted
-            "text":          str    — full extracted text (if success)
-            "page_count":    int    — total pages in PDF
-            "skipped_pages": int    — pages skipped as duplicates
-            "scanned_pages": int    — pages that appear to be scanned/image
-            "use_fallback":  bool   — True if majority of pages are scanned
+            "success":         bool  — True if there's anything to send (text and/or images)
+            "text":            str   — combined text from native-extracted + OCR'd pages
+            "page_count":      int   — total pages in PDF
+            "skipped_pages":   int   — pages skipped as exact duplicates
+            "scanned_pages":   int   — pages sent to Claude as images (annotated, or OCR failed)
+            "ocr_pages":       int   — pages recovered via local OCR instead of an image
+            "fallback_images": list  — [(page_number, PIL.Image), ...] needing image content blocks
+            "use_fallback":    bool  — True if any page needs an image (kept for compatibility)
         }
     """
     file.seek(0)
     try:
-        seen_hashes   = set()
-        pages_text    = []
-        scanned_pages = 0
-        skipped_pages = 0
-        total_pages   = 0
+        seen_hashes      = set()
+        pages_text       = []
+        scanned_pages    = 0
+        ocr_pages        = 0
+        skipped_pages    = 0
+        total_pages      = 0
+        fallback_images  = []
 
         with pdfplumber.open(file) as pdf:
             total_pages = len(pdf.pages)
 
-            for page in pdf.pages:
+            for page_num, page in enumerate(pdf.pages, 1):
                 # ── Extract raw text ──
                 raw_text = page.extract_text() or ""
 
@@ -215,10 +292,25 @@ def extract_text_from_pdf(file) -> dict:
 
                 combined = (raw_text + "\n" + table_text).strip()
 
-                # ── Check if scanned/image page ──
+                # ── No native text layer — try local OCR, else keep as an image ──
                 if len(combined) < config.MIN_PAGE_TEXT_CHARS:
-                    scanned_pages += 1
-                    continue
+                    page_image = page.to_image(
+                        resolution=config.OCR_RENDER_RESOLUTION_DPI
+                    ).original
+
+                    if _ocr_available() and not _page_has_annotation(page_image):
+                        ocr_text = _ocr_page_text(page_image)
+                        if len(ocr_text) >= config.MIN_PAGE_TEXT_CHARS:
+                            combined = ocr_text
+                            ocr_pages += 1
+                        else:
+                            scanned_pages += 1
+                            fallback_images.append((page_num, page_image))
+                            continue
+                    else:
+                        scanned_pages += 1
+                        fallback_images.append((page_num, page_image))
+                        continue
 
                 # ── Deduplicate exact pages ──
                 page_hash = hashlib.md5(combined.encode("utf-8")).hexdigest()
@@ -229,30 +321,120 @@ def extract_text_from_pdf(file) -> dict:
 
                 pages_text.append(combined)
 
-        # If majority of pages are scanned, fall back to PDF binary
-        use_fallback = scanned_pages > (total_pages / 2)
-
         full_text = "\n\n--- PAGE BREAK ---\n\n".join(pages_text)
 
         return {
-            "success":       bool(full_text.strip()) and not use_fallback,
-            "text":          full_text,
-            "page_count":    total_pages,
-            "skipped_pages": skipped_pages,
-            "scanned_pages": scanned_pages,
-            "use_fallback":  use_fallback,
+            "success":         bool(full_text.strip()) or bool(fallback_images),
+            "text":            full_text,
+            "page_count":      total_pages,
+            "skipped_pages":   skipped_pages,
+            "scanned_pages":   scanned_pages,
+            "ocr_pages":       ocr_pages,
+            "fallback_images": fallback_images,
+            "use_fallback":    bool(fallback_images),
         }
 
     except Exception as e:
         return {
-            "success":       False,
-            "text":          "",
-            "page_count":    0,
-            "skipped_pages": 0,
-            "scanned_pages": 0,
-            "use_fallback":  True,
-            "error":         str(e),
+            "success":         False,
+            "text":            "",
+            "page_count":      0,
+            "skipped_pages":   0,
+            "scanned_pages":   0,
+            "ocr_pages":       0,
+            "fallback_images": [],
+            "use_fallback":    True,
+            "error":           str(e),
         }
+
+
+# ── Content-block building (shared by realtime + batch submission) ───────────
+
+def build_file_content(f, log_fn=None) -> dict:
+    """
+    Builds Claude content blocks for a single uploaded file: one text block
+    covering native-extracted + OCR'd pages, plus a text/image block pair per
+    page that needs the image fallback (handwriting/stamps detected, local
+    OCR unavailable, or OCR produced too little text).
+
+    log_fn: optional callable(str) for per-line logging (batch mode).
+
+    Returns:
+        {
+            "content":        list  — content blocks for this file (extraction prompt not included)
+            "page_count":     int
+            "fallback_pages": int   — pages sent as images
+            "ocr_pages":      int   — pages recovered via local OCR
+            "notes":          list[str]  — human-readable notes for the email/UI
+        }
+    """
+    def log(msg):
+        if log_fn:
+            log_fn(msg)
+
+    extraction = extract_text_from_pdf(f)
+    page_count = extraction.get("page_count", 1) or 1
+    content    = []
+    notes      = []
+
+    if extraction["text"].strip():
+        header_notes = []
+        if extraction["skipped_pages"] > 0:
+            header_notes.append(f"{extraction['skipped_pages']} duplicate page(s) skipped")
+        if extraction["ocr_pages"] > 0:
+            header_notes.append(f"{extraction['ocr_pages']} page(s) read via local OCR")
+        if extraction["scanned_pages"] > 0:
+            header_notes.append(f"{extraction['scanned_pages']} page(s) sent as images below")
+
+        header = f"=== FILE: {f.name} ==="
+        if header_notes:
+            header += f" [{', '.join(header_notes)}]"
+
+        content.append({"type": "text", "text": header + "\n\n" + extraction["text"]})
+        if header_notes:
+            notes.append(f"{f.name}: {', '.join(header_notes)}")
+
+        log(
+            f"{f.name} → text extraction ({page_count} pages"
+            + (f", {extraction['ocr_pages']} via local OCR" if extraction["ocr_pages"] else "")
+            + (f", {extraction['skipped_pages']} dup pages skipped" if extraction["skipped_pages"] else "")
+            + ")"
+        )
+
+    for page_num, pil_image in extraction.get("fallback_images", []):
+        buf = io.BytesIO()
+        pil_image.save(buf, format="PNG")
+        b64_data = base64.standard_b64encode(buf.getvalue()).decode("utf-8")
+        content.append({
+            "type": "text",
+            "text": f"=== FILE: {f.name} — PAGE {page_num} (image below) ===",
+        })
+        content.append({
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": b64_data},
+        })
+        log(f"{f.name} page {page_num} → image fallback (handwriting/stamp detected, or OCR unavailable)")
+
+    if not content:
+        # Extraction produced nothing at all (e.g. pdfplumber couldn't open the
+        # file) — last-resort fallback: send the whole file as-is.
+        f.seek(0)
+        pdf_bytes = f.read()
+        b64_data  = base64.standard_b64encode(pdf_bytes).decode("utf-8")
+        content.append({
+            "type": "document",
+            "source": {"type": "base64", "media_type": "application/pdf", "data": b64_data},
+            "title": f.name,
+        })
+        log(f"{f.name} → whole-file PDF fallback (extraction produced no usable content)")
+
+    return {
+        "content":        content,
+        "page_count":     page_count,
+        "fallback_pages": extraction.get("scanned_pages", 0),
+        "ocr_pages":      extraction.get("ocr_pages", 0),
+        "notes":          notes,
+    }
 
 
 # ── Duplicate invoice number detection ───────────────────────────────────────

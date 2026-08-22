@@ -103,6 +103,25 @@ SKIP_DUPLICATE_INVOICE_NUMBERS = _optional(
 # ── PDF text extraction ────────────────────────────────────────────────────
 MIN_PAGE_TEXT_CHARS = int(_optional("MIN_PAGE_TEXT_CHARS", "50"))
 
+# ── Local OCR (scanned pages without a text layer) ─────────────────────────
+# For pages with no native text layer, a page is first checked for
+# handwriting/stamps (colored, non-black ink — pen and rubber stamps are
+# almost always blue/purple/red, unlike printed black text). Clean pages go
+# through local Tesseract OCR (free, fast, no Claude cost); pages with
+# handwriting/stamps skip OCR and are sent to Claude as an image instead,
+# since OCR has been observed to silently mis-read handwritten numbers
+# (e.g. "9000" read as "2000") without a low-confidence signal to catch it —
+# too risky for financial figures.
+# HANDWRITING_INK_THRESHOLD: fraction (0-1) of non-white, non-black/gray
+# pixels on a page above which it's treated as annotated. Validated empirically:
+# clean printed pages measure ~0%, pages with handwriting/stamps measure 4-8%+.
+HANDWRITING_INK_THRESHOLD = float(_optional("HANDWRITING_INK_THRESHOLD", "0.005"))
+# Same render is used both for the local OCR attempt and, if a page ends up
+# needing the image-fallback path instead, as the image sent to Claude — so
+# this shouldn't be pushed too low even though lower helps OCR speed, since
+# accuracy on the fallback path is the whole reason that path exists.
+OCR_RENDER_RESOLUTION_DPI = int(_optional("OCR_RENDER_RESOLUTION_DPI", "200"))
+
 # ── Extraction prompt ──────────────────────────────────────────────────────
 # Uses abbreviated JSON keys to minimise output tokens.
 # Key map (used in utils.py to expand back to full names for Excel):
