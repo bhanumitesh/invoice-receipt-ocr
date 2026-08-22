@@ -197,20 +197,37 @@ def submit_batch(uploaded_files: list, user_email: str = None, job_id: str = Non
                 content = chunk_content + [{"type": "text", "text": config.EXTRACTION_PROMPT}]
 
                 # The output-300k beta raises the per-request max_tokens cap
-                # on the Batch API (Sonnet 4.6 and others) from the standard
-                # 128k up to 300k — retrieval doesn't need the beta header,
-                # only submission does.
-                batch = client.beta.messages.batches.create(
-                    betas=["output-300k-2026-03-24"],
-                    requests=[{
+                # on the Batch API from a model's standard cap up to 300k —
+                # but only for models Anthropic has confirmed support it (see
+                # config.OUTPUT_300K_BETA_MODELS). Sending an unsupported
+                # beta isn't something to assume is safely ignored, so it's
+                # only included when the configured model is on that list.
+                # Retrieval doesn't need the beta header either way, only
+                # submission does.
+                use_beta = config.MODEL in config.OUTPUT_300K_BETA_MODELS
+                max_tokens = config.BATCH_MAX_TOKENS
+                if not use_beta:
+                    # Without the beta, exceeding a model's real standard cap
+                    # gets the whole request rejected by the API outright
+                    # (not silently capped) — 64k is the lowest standard cap
+                    # among current models, so it's a safe ceiling for any
+                    # model not on the confirmed-beta list.
+                    max_tokens = min(max_tokens, 64_000)
+
+                create_kwargs = {
+                    "requests": [{
                         "custom_id": f"invoice_run_{ts}_{req_idx}",
                         "params": {
                             "model":      config.MODEL,
-                            "max_tokens": config.BATCH_MAX_TOKENS,
+                            "max_tokens": max_tokens,
                             "messages":   [{"role": "user", "content": content}],
                         },
                     }],
-                )
+                }
+                if use_beta:
+                    create_kwargs["betas"] = ["output-300k-2026-03-24"]
+
+                batch = client.beta.messages.batches.create(**create_kwargs)
                 batch_ids.append(batch.id)
                 log(f"{f.name} chunk {chunk_idx + 1}/{n_chunks} → submitted as {batch.id}")
 
@@ -408,12 +425,18 @@ def retrieve_results(
                     stop_reason = message.stop_reason
 
                     if stop_reason == "max_tokens":
+                        beta_ceiling = config.MODEL in config.OUTPUT_300K_BETA_MODELS
                         err = (
                             f"Output truncated for {result.custom_id} — Claude hit the "
                             f"max_tokens limit ({config.BATCH_MAX_TOKENS}) for this chunk. "
-                            f"Raise BATCH_MAX_TOKENS (up to 300000), or lower "
-                            f"MAX_FALLBACK_PAGES_PER_REQUEST if this chunk had an unusually "
-                            f"large number of line items."
+                            + (
+                                f"Raise BATCH_MAX_TOKENS (up to 300000 on {config.MODEL})"
+                                if beta_ceiling else
+                                f"Raise BATCH_MAX_TOKENS (up to 64000 — {config.MODEL} isn't on "
+                                f"Anthropic's supported list for the higher 300000 cap)"
+                            )
+                            + f", or lower MAX_FALLBACK_PAGES_PER_REQUEST if this chunk had an "
+                            f"unusually large number of line items."
                         )
                         errors.append(err)
                         write_log(job_id, f"WARNING: {err}")

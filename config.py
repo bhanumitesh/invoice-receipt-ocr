@@ -34,25 +34,52 @@ def _optional(var: str, default: str) -> str:
 
 
 # ── Anthropic (required) ───────────────────────────────────────────────────
+# MODEL: defaults to Haiku 4.5 — roughly 3x cheaper than Sonnet on both
+# input and output tokens, which matters most here since scanned-page
+# extraction is mostly image + output tokens, not reasoning-heavy work.
+# Structured table extraction from clearly-laid-out invoices is generally
+# within a smaller model's ability, but this hasn't been validated against
+# Sonnet's accuracy on this app's real documents — if extraction quality
+# regresses (wrong amounts, missed line items), switch back via
+# ANTHROPIC_MODEL=claude-sonnet-4-6 without any code change.
 ANTHROPIC_API_KEY = _require("ANTHROPIC_API_KEY")
-MODEL             = _optional("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+MODEL             = _optional("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
 
 # ── Pricing (optional — override via env if rates change) ─────────────────
-PRICE_INPUT_PER_MTOK  = float(_optional("PRICE_INPUT_PER_MTOK",  "3.00"))
-PRICE_OUTPUT_PER_MTOK = float(_optional("PRICE_OUTPUT_PER_MTOK", "15.00"))
+# Defaults match Haiku 4.5. These only affect this app's own cost estimates
+# shown in logs/emails — not what Anthropic actually bills — so keep them in
+# sync with whichever model ANTHROPIC_MODEL is actually set to, or the cost
+# figures this app reports will be wrong even though the real bill isn't.
+PRICE_INPUT_PER_MTOK  = float(_optional("PRICE_INPUT_PER_MTOK",  "1.00"))
+PRICE_OUTPUT_PER_MTOK = float(_optional("PRICE_OUTPUT_PER_MTOK", "5.00"))
 
 # ── API output settings ────────────────────────────────────────────────────
 # MAX_TOKENS       : used by the real-time (synchronous Messages API) path.
-#                     Sonnet 4.6's standard sync cap is 128,000 — keep this at
-#                     or below that.
-# BATCH_MAX_TOKENS : used by the Batch API path, which submits the
-#                     `output-300k-2026-03-24` beta header (see
-#                     batch_processor.py) to raise the per-request cap to
-#                     300,000 — far larger than any single invoice needs, so a
-#                     lower default keeps typical jobs fast. Raise via env var
-#                     if a single very dense invoice still truncates.
+#                     Haiku 4.5's standard sync cap is 64,000 — keep this at
+#                     or below that (Sonnet 4.6's is 128,000, higher).
+# BATCH_MAX_TOKENS : used by the Batch API path. For models in
+#                     OUTPUT_300K_BETA_MODELS below, this is submitted with
+#                     the `output-300k-2026-03-24` beta header (see
+#                     batch_processor.py) to raise the per-request cap as
+#                     high as 300,000. Haiku 4.5 isn't on Anthropic's
+#                     supported list for that beta, so on Haiku the real
+#                     ceiling is its standard 64,000 batch cap regardless of
+#                     this value — 32,000 leaves comfortable headroom under
+#                     that either way. Raise via env var if a single very
+#                     dense invoice still truncates (up to 64,000 on Haiku,
+#                     300,000 on a supported Sonnet/Opus model).
 MAX_TOKENS       = int(_optional("MAX_TOKENS", "8192"))
 BATCH_MAX_TOKENS = int(_optional("BATCH_MAX_TOKENS", "32000"))
+
+# Models Anthropic has confirmed support the output-300k-2026-03-24 beta
+# (see the Batch API extended-output docs). Haiku 4.5 is deliberately not
+# in this list — sending an unsupported beta header isn't something to
+# assume is safely ignored, so batch_processor.py only includes it when
+# config.MODEL is one of these.
+OUTPUT_300K_BETA_MODELS = {
+    "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6",
+    "claude-sonnet-5", "claude-sonnet-4-6",
+}
 
 # ── Email / Resend (required) ──────────────────────────────────────────────
 # Sign up free at resend.com — 3,000 emails/month permanently free

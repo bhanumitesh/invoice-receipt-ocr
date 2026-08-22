@@ -69,16 +69,21 @@ cp .env.example .env
 
 | Variable | Default | Description |
 |---|---|---|
-| `ANTHROPIC_MODEL` | `claude-sonnet-4-6` | Claude model to use |
+| `ANTHROPIC_MODEL` | `claude-haiku-4-5-20251001` | Claude model to use — defaults to Haiku 4.5 for cost (~3x cheaper than Sonnet); switch to `claude-sonnet-4-6` if extraction accuracy needs it |
 | `MAX_TOKENS` | `8192` | Max output tokens for real-time (synchronous) API calls |
-| `BATCH_MAX_TOKENS` | `32000` | Max output tokens per file for Batch API calls — submitted with the `output-300k-2026-03-24` beta header, so this can go up to `300000` if a single invoice has an unusually large number of line items |
-| `PRICE_INPUT_PER_MTOK` | `3.00` | Input token price (USD per million) |
-| `PRICE_OUTPUT_PER_MTOK` | `15.00` | Output token price (USD per million) |
+| `BATCH_MAX_TOKENS` | `32000` | Max output tokens per file for Batch API calls. For models in `OUTPUT_300K_BETA_MODELS` (config.py — Sonnet/Opus family), this is submitted with the `output-300k-2026-03-24` beta header and can go up to `300000`. Haiku 4.5 isn't on Anthropic's supported list for that beta, so on Haiku the real ceiling is its standard `64000` batch cap regardless of this value |
+| `PRICE_INPUT_PER_MTOK` | `1.00` | Input token price (USD per million) — matches Haiku 4.5; update if you change `ANTHROPIC_MODEL` |
+| `PRICE_OUTPUT_PER_MTOK` | `5.00` | Output token price (USD per million) — matches Haiku 4.5; update if you change `ANTHROPIC_MODEL` |
 | `POLL_INTERVAL_SECONDS` | `120` | How often to check batch status (seconds) |
 | `SKIP_DUPLICATE_INVOICE_NUMBERS` | `true` | Skip duplicate invoice numbers across files |
 | `MIN_PAGE_TEXT_CHARS` | `50` | Min chars to consider a page text-based (below = try OCR, else image fallback) |
 | `HANDWRITING_INK_THRESHOLD` | `0.005` | Fraction of colored (non-black) ink pixels above which a page is treated as having handwriting/stamps and skips local OCR |
-| `OCR_RENDER_RESOLUTION_DPI` | `200` | Resolution used to render scanned pages, both for the local OCR attempt and as the image sent to Claude if OCR is skipped |
+| `OCR_RENDER_RESOLUTION_DPI` | `150` | Resolution used to render scanned pages, both for the local OCR attempt and as the image sent to Claude if OCR is skipped |
+| `ANNOTATION_CHECK_MAX_DIM` | `400` | Max pixel dimension of the thumbnail used for the handwriting/stamp check — doesn't affect the image actually sent to Claude, only this detection step |
+| `IMAGE_JPEG_QUALITY` | `85` | JPEG quality for fallback-page images sent to Claude |
+| `MAX_REQUEST_PAYLOAD_MB` | `25` | Safety margin under Anthropic's 32MB request-size limit — a chunk still over this after JPEG compression fails clearly instead of being rejected by the API |
+| `CPU_YIELD_SECONDS` | `0.05` | Cooperative pause after each page needing the expensive render/detect/encode path, so a multi-page file doesn't starve the app's own health-check handling on CPU-constrained hosts |
+| `MAX_FALLBACK_PAGES_PER_REQUEST` | `5` | A file with more fallback-image pages than this is split across multiple separate Batch API jobs instead of one, so local processing happens in smaller bursts with real network I/O gaps between them |
 | `TALLY_DEFAULT_LEDGER` | `Purchase Account` | Default ledger for all Tally XML imports — set to exact ledger name in your Tally company |
 | `TALLY_COMPANY_NAME` | `My Company` | Your company name exactly as it appears in Tally |
 
@@ -166,12 +171,23 @@ Every run produces three files:
 
 ---
 
-## Cost Estimates (Claude Sonnet 4.6)
+## Cost Estimates (Claude Haiku 4.5, the default model)
 
-| Mode | ~Cost per job | Notes |
-|---|---|---|
-| Real-time | ~$0.03–$0.10 | Depends on number and density of invoices |
-| Batch API | ~$0.015–$0.05 | 50% cheaper — same output, processed async |
+Real per-job costs observed in production (Sonnet 4.6, before the default
+model switch to Haiku) ranged roughly $0.01–$0.55 depending on file size and
+whether pages were text-based or scanned images — scanned/image-heavy files
+cost several times more than text-based ones per page (see PDF handling
+below). Haiku 4.5 prices at roughly a third of Sonnet's per-token rate, so
+expect proportionally lower costs, but this hasn't been validated with real
+production jobs yet — treat any specific number here as a rough guide, not
+a guarantee, until it has.
+
+**Before relying on Haiku 4.5 in production:** its extraction accuracy on
+your real documents hasn't been validated against Sonnet's — run a side-by-side
+comparison on a batch of real invoices and check the extracted line items
+match before trusting it for financial data. Switch back to Sonnet via
+`ANTHROPIC_MODEL=claude-sonnet-4-6` (and update `PRICE_INPUT_PER_MTOK` /
+`PRICE_OUTPUT_PER_MTOK` back to `3.00` / `15.00`) if accuracy regresses.
 
 Cost breakdown (input/output tokens + total) is shown in the UI for real-time
 and included in the email for batch jobs, along with savings vs real-time.
