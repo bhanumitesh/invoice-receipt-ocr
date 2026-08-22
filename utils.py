@@ -8,6 +8,7 @@ import hashlib
 import io
 import json
 import re
+import time
 import traceback
 from datetime import datetime
 
@@ -214,18 +215,27 @@ def _page_has_annotation(pil_image, threshold: float = None) -> bool:
     observed to silently misread handwritten numbers (e.g. "9000" as "2000")
     without a low-confidence signal to catch it, so annotated pages skip OCR
     entirely and are sent to Claude as images instead.
+
+    Runs on a downscaled thumbnail (config.ANNOTATION_CHECK_MAX_DIM), not
+    the full-resolution render — a colored-pixel fraction doesn't need
+    full resolution to be representative, and this is the single biggest
+    per-page CPU cost in the fallback pipeline, so shrinking it matters most
+    on CPU-constrained hosts. Does not affect the image actually sent to
+    Claude — pil_image itself is untouched.
     """
     threshold = config.HANDWRITING_INK_THRESHOLD if threshold is None else threshold
     rgb = pil_image.convert("RGB")
     if rgb.width == 0 or rgb.height == 0:
         return False
-    hsv = rgb.convert("HSV")
+    thumb = rgb.copy()
+    thumb.thumbnail((config.ANNOTATION_CHECK_MAX_DIM, config.ANNOTATION_CHECK_MAX_DIM))
+    hsv = thumb.convert("HSV")
     _, s, v = hsv.split()
     sat_mask         = s.point(lambda p: 255 if p > 30  else 0)
     dark_enough_mask = v.point(lambda p: 255 if p < 240 else 0)
     combined = ImageChops.multiply(sat_mask, dark_enough_mask)
     colored_pixels = combined.histogram()[255]
-    return (colored_pixels / (rgb.width * rgb.height)) > threshold
+    return (colored_pixels / (thumb.width * thumb.height)) > threshold
 
 
 def _ocr_page_text(pil_image) -> str:
@@ -326,6 +336,13 @@ def extract_text_from_pdf(file, light: bool = False) -> dict:
                     page_image = page.to_image(
                         resolution=config.OCR_RENDER_RESOLUTION_DPI
                     ).original
+
+                    # Cooperative yield — see config.CPU_YIELD_SECONDS. Placed
+                    # right after the render (the first and one of the
+                    # heaviest steps for this page) so pages needing the
+                    # fallback path don't run their CPU-bound work back-to-back
+                    # with no gap for other threads on constrained hosts.
+                    time.sleep(config.CPU_YIELD_SECONDS)
 
                     if _ocr_available() and not _page_has_annotation(page_image):
                         ocr_text = _ocr_page_text(page_image)

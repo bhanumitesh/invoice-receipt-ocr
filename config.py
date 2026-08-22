@@ -119,8 +119,21 @@ HANDWRITING_INK_THRESHOLD = float(_optional("HANDWRITING_INK_THRESHOLD", "0.005"
 # Same render is used both for the local OCR attempt and, if a page ends up
 # needing the image-fallback path instead, as the image sent to Claude — so
 # this shouldn't be pushed too low even though lower helps OCR speed, since
-# accuracy on the fallback path is the whole reason that path exists.
-OCR_RENDER_RESOLUTION_DPI = int(_optional("OCR_RENDER_RESOLUTION_DPI", "200"))
+# accuracy on the fallback path is the whole reason that path exists. Lowered
+# from 200 to 150 as part of reducing CPU cost per page on constrained hosts
+# (see CPU_YIELD_SECONDS below) — still ~1275x1650px for a standard page,
+# comfortably legible.
+OCR_RENDER_RESOLUTION_DPI = int(_optional("OCR_RENDER_RESOLUTION_DPI", "150"))
+
+# The handwriting/stamp check only needs a statistically representative
+# colored-pixel fraction, not full-resolution accuracy — so it runs on a
+# downscaled thumbnail of the render (longest side capped at this many
+# pixels) rather than scanning every pixel of the full-resolution image.
+# This is the single biggest per-page CPU cost of the fallback pipeline, so
+# shrinking it matters most on CPU-constrained hosts (e.g. Render's 0.1 CPU
+# free tier). Does not affect the resolution of the image actually sent to
+# Claude — only this detection step.
+ANNOTATION_CHECK_MAX_DIM = int(_optional("ANNOTATION_CHECK_MAX_DIM", "400"))
 
 # Images sent to Claude are JPEG (not PNG) — PNG's lossless compression is a
 # poor fit for noisy photographic scan content and can run 3x+ larger than a
@@ -135,6 +148,18 @@ IMAGE_JPEG_QUALITY = int(_optional("IMAGE_JPEG_QUALITY", "85"))
 # compression fails clearly with a "file too large" error instead of being
 # submitted and rejected by the API with an opaque error.
 MAX_REQUEST_PAYLOAD_MB = float(_optional("MAX_REQUEST_PAYLOAD_MB", "25"))
+
+# Brief cooperative pause after each page that needs the expensive
+# render/detect/encode path. Submission already runs off the main Streamlit
+# script thread (see batch_processor.start_submission_thread), but Python's
+# GIL means CPU-bound work in that background thread still competes with the
+# main thread for the same core — on a host with a fraction of one CPU
+# (e.g. Render free tier), several pages back-to-back can still starve
+# Streamlit's own health-check handling long enough for the frontend to
+# drop the connection. This yield gives that other thread real
+# opportunities to run between pages. Adds well under a second total even
+# for a 20-page file — negligible next to the per-page work itself.
+CPU_YIELD_SECONDS = float(_optional("CPU_YIELD_SECONDS", "0.05"))
 
 # ── Extraction prompt ──────────────────────────────────────────────────────
 # Uses abbreviated JSON keys to minimise output tokens.
