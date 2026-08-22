@@ -161,6 +161,18 @@ MAX_REQUEST_PAYLOAD_MB = float(_optional("MAX_REQUEST_PAYLOAD_MB", "25"))
 # for a 20-page file — negligible next to the per-page work itself.
 CPU_YIELD_SECONDS = float(_optional("CPU_YIELD_SECONDS", "0.05"))
 
+# A file with more fallback-image pages than this is split across multiple
+# separate Batch API submissions instead of one. Per-page cooperative yields
+# (CPU_YIELD_SECONDS) weren't enough on their own — a real 15-page annotated
+# file still intermittently starved Streamlit's health-check handling even
+# with those yields, since the whole local build (render+detect+encode for
+# every page) still happens as one continuous span before any network call.
+# Chunking submits each group as its own Batch API job — the network call
+# for each chunk is a genuine I/O wait (releases the GIL properly), giving
+# real breathing room between chunks rather than hoping short in-process
+# sleeps are enough. A 5-page chunk has been confirmed to submit reliably.
+MAX_FALLBACK_PAGES_PER_REQUEST = int(_optional("MAX_FALLBACK_PAGES_PER_REQUEST", "5"))
+
 # ── Extraction prompt ──────────────────────────────────────────────────────
 # Uses abbreviated JSON keys to minimise output tokens.
 # Key map (used in utils.py to expand back to full names for Excel):

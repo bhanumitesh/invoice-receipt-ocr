@@ -493,6 +493,129 @@ def build_file_content(f, log_fn=None) -> dict:
     }
 
 
+def build_file_content_chunks(f, log_fn=None) -> dict:
+    """
+    Like build_file_content(), but splits a file's fallback-image pages
+    across multiple content chunks (each becomes its own Batch API request)
+    when there are more than config.MAX_FALLBACK_PAGES_PER_REQUEST of them.
+
+    Native/OCR text (if any) goes in chunk 0 only — every fallback image
+    still appears exactly once across all chunks, so there's no duplicate
+    extraction risk from splitting; the existing invoice-number+line-detail
+    dedup pass (deduplicate_items) is still there as a safety net regardless.
+
+    Submitting each chunk as its own separate Batch API job (done by the
+    caller, not here) gives genuine breathing room between chunks — each
+    submission's network call is a real I/O wait, unlike an in-process
+    sleep, which per-page cooperative yields alone weren't enough to
+    guarantee on very CPU-constrained hosts.
+
+    log_fn: optional callable(str) for per-line logging (batch mode).
+
+    Returns:
+        {
+            "chunks":         list[list[content_block]]  — one or more chunks, each a full content list
+            "page_count":     int
+            "fallback_pages": int   — pages sent as images (across all chunks)
+            "ocr_pages":      int   — pages recovered via local OCR
+            "notes":          list[str]  — human-readable notes for the email/UI
+        }
+    """
+    def log(msg):
+        if log_fn:
+            log_fn(msg)
+
+    extraction = extract_text_from_pdf(f)
+    page_count = extraction.get("page_count", 1) or 1
+    notes      = []
+
+    header_notes = []
+    if extraction["skipped_pages"] > 0:
+        header_notes.append(f"{extraction['skipped_pages']} duplicate page(s) skipped")
+    if extraction["ocr_pages"] > 0:
+        header_notes.append(f"{extraction['ocr_pages']} page(s) read via local OCR")
+    if extraction["scanned_pages"] > 0:
+        header_notes.append(f"{extraction['scanned_pages']} page(s) sent as images below")
+    if header_notes:
+        notes.append(f"{f.name}: {', '.join(header_notes)}")
+
+    fallback_images = extraction.get("fallback_images", [])
+    chunk_size      = max(1, config.MAX_FALLBACK_PAGES_PER_REQUEST)
+    image_groups    = [
+        fallback_images[i:i + chunk_size]
+        for i in range(0, len(fallback_images), chunk_size)
+    ] or [[]]  # always at least one group, even with zero fallback images
+
+    chunks = []
+
+    for chunk_idx, image_group in enumerate(image_groups):
+        block         = []
+        payload_bytes = 0
+
+        if chunk_idx == 0 and extraction["text"].strip():
+            header = f"=== FILE: {f.name} ==="
+            if header_notes:
+                header += f" [{', '.join(header_notes)}]"
+            block.append({"type": "text", "text": header + "\n\n" + extraction["text"]})
+            payload_bytes += len(header) + len(extraction["text"])
+            log(
+                f"{f.name} → text extraction ({page_count} pages"
+                + (f", {extraction['ocr_pages']} via local OCR" if extraction["ocr_pages"] else "")
+                + (f", {extraction['skipped_pages']} dup pages skipped" if extraction["skipped_pages"] else "")
+                + ")"
+            )
+
+        for page_num, jpeg_bytes in image_group:
+            b64_data = base64.standard_b64encode(jpeg_bytes).decode("utf-8")
+            page_header = f"=== FILE: {f.name} — PAGE {page_num} (image below) ==="
+            block.append({"type": "text", "text": page_header})
+            block.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/jpeg", "data": b64_data},
+            })
+            payload_bytes += len(page_header) + len(b64_data)
+            log(
+                f"{f.name} page {page_num} → image fallback "
+                f"(chunk {chunk_idx + 1}/{len(image_groups)}, handwriting/stamp detected, "
+                f"or OCR unavailable)"
+            )
+
+        if not block:
+            continue
+
+        payload_mb = payload_bytes / 1024 / 1024
+        if payload_mb > config.MAX_REQUEST_PAYLOAD_MB:
+            raise ValueError(
+                f"{f.name} (chunk {chunk_idx + 1}/{len(image_groups)}) is too large to "
+                f"process in one request ({payload_mb:.1f}MB, limit is "
+                f"{config.MAX_REQUEST_PAYLOAD_MB:.0f}MB) — try lowering "
+                f"MAX_FALLBACK_PAGES_PER_REQUEST."
+            )
+
+        chunks.append(block)
+
+    if not chunks:
+        # Extraction produced nothing at all (e.g. pdfplumber couldn't open the
+        # file) — last-resort fallback: send the whole file as-is, as one chunk.
+        f.seek(0)
+        pdf_bytes = f.read()
+        b64_data  = base64.standard_b64encode(pdf_bytes).decode("utf-8")
+        chunks.append([{
+            "type": "document",
+            "source": {"type": "base64", "media_type": "application/pdf", "data": b64_data},
+            "title": f.name,
+        }])
+        log(f"{f.name} → whole-file PDF fallback (extraction produced no usable content)")
+
+    return {
+        "chunks":         chunks,
+        "page_count":     page_count,
+        "fallback_pages": extraction.get("scanned_pages", 0),
+        "ocr_pages":      extraction.get("ocr_pages", 0),
+        "notes":          notes,
+    }
+
+
 # ── Duplicate invoice number detection ───────────────────────────────────────
 
 def deduplicate_items(items: list) -> tuple:
