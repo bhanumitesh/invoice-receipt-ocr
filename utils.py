@@ -234,6 +234,19 @@ def _ocr_page_text(pil_image) -> str:
         return ""
 
 
+def _encode_page_jpeg(pil_image) -> bytes:
+    """
+    Encodes a rendered page to JPEG bytes immediately after rendering, so the
+    much larger decoded PIL Image (~10MB+ per page at OCR_RENDER_RESOLUTION_DPI)
+    isn't kept in memory alongside every other fallback page in the same file —
+    only the small JPEG bytes are. Matters on memory-constrained hosts: a file
+    with many fallback pages previously held all of them decoded at once.
+    """
+    buf = io.BytesIO()
+    pil_image.convert("RGB").save(buf, format="JPEG", quality=config.IMAGE_JPEG_QUALITY)
+    return buf.getvalue()
+
+
 # ── PDF text extraction ───────────────────────────────────────────────────────
 
 def extract_text_from_pdf(file) -> dict:
@@ -257,7 +270,7 @@ def extract_text_from_pdf(file) -> dict:
             "skipped_pages":   int   — pages skipped as exact duplicates
             "scanned_pages":   int   — pages sent to Claude as images (annotated, or OCR failed)
             "ocr_pages":       int   — pages recovered via local OCR instead of an image
-            "fallback_images": list  — [(page_number, PIL.Image), ...] needing image content blocks
+            "fallback_images": list  — [(page_number, jpeg_bytes), ...] needing image content blocks
             "use_fallback":    bool  — True if any page needs an image (kept for compatibility)
         }
     """
@@ -305,11 +318,11 @@ def extract_text_from_pdf(file) -> dict:
                             ocr_pages += 1
                         else:
                             scanned_pages += 1
-                            fallback_images.append((page_num, page_image))
+                            fallback_images.append((page_num, _encode_page_jpeg(page_image)))
                             continue
                     else:
                         scanned_pages += 1
-                        fallback_images.append((page_num, page_image))
+                        fallback_images.append((page_num, _encode_page_jpeg(page_image)))
                         continue
 
                 # ── Deduplicate exact pages ──
@@ -403,10 +416,8 @@ def build_file_content(f, log_fn=None) -> dict:
 
     payload_bytes = sum(len(b["text"]) for b in content if b["type"] == "text")
 
-    for page_num, pil_image in extraction.get("fallback_images", []):
-        buf = io.BytesIO()
-        pil_image.convert("RGB").save(buf, format="JPEG", quality=config.IMAGE_JPEG_QUALITY)
-        b64_data = base64.standard_b64encode(buf.getvalue()).decode("utf-8")
+    for page_num, jpeg_bytes in extraction.get("fallback_images", []):
+        b64_data = base64.standard_b64encode(jpeg_bytes).decode("utf-8")
         page_header = f"=== FILE: {f.name} — PAGE {page_num} (image below) ==="
         content.append({"type": "text", "text": page_header})
         content.append({
