@@ -3,10 +3,12 @@
 #
 #  Thread safety:
 #    Background thread NEVER touches st.session_state.
-#    All communication to UI is via files in batch_logs/:
-#      batch_<id>.log     → append-only human-readable log
-#      batch_<id>.status  → JSON written once when batch processing ends; app.py polls this
-#      submit_<job>.status → JSON written once submission itself finishes; app.py polls this
+#    All communication to UI is via files in batch_logs/, keyed throughout by
+#    job_id (= credit_job_id, generated before any Anthropic batch exists and
+#    constant for the whole job's life):
+#      <job_id>.log         → append-only human-readable log
+#      <job_id>.status      → JSON written once all batch jobs end; app.py polls this
+#      submit_<job_id>.status → JSON written once submission itself finishes; app.py polls this
 #
 #  Submission runs in a background thread (start_submission_thread) rather
 #  than blocking the main Streamlit script, for the same reason polling does:
@@ -16,6 +18,18 @@
 #  worker stops responding to the frontend's own keep-alive requests, so the
 #  browser shows a "Connection error" — regardless of whether submission
 #  itself would have succeeded.
+#
+#  A file with many fallback-image pages is further split across MULTIPLE
+#  separate Batch API jobs (see build_file_content_chunks /
+#  MAX_FALLBACK_PAGES_PER_REQUEST) rather than one job with everything
+#  bundled in. Per-page in-process cooperative yields alone weren't reliable
+#  enough on very CPU-constrained hosts (confirmed: a 15-page real annotated
+#  file still intermittently starved health-checks with those yields alone)
+#  — each chunk's own network call is a genuine I/O wait, which is a more
+#  reliable way to give the health-check thread real breathing room between
+#  bursts of local CPU-bound work than an in-process sleep. This means one
+#  file can now produce several Anthropic batch_ids; poll_until_done and
+#  retrieve_results operate on a list of them and merge results together.
 # ─────────────────────────────────────────────
 
 import json
@@ -30,7 +44,7 @@ import anthropic
 import config
 from db import finalize_credit_reservation, refund_credit_reservation
 from utils import (
-    build_file_content,
+    build_file_content_chunks,
     calculate_cost,
     create_excel,
     create_tally_xml,
@@ -46,20 +60,20 @@ LOG_DIR.mkdir(exist_ok=True)
 
 # ── Log / status file helpers ─────────────────────────────────────────────────
 
-def _log_path(batch_id: str)    -> Path: return LOG_DIR / f"batch_{batch_id}.log"
-def _status_path(batch_id: str) -> Path: return LOG_DIR / f"batch_{batch_id}.status"
+def _log_path(job_id: str)    -> Path: return LOG_DIR / f"{job_id}.log"
+def _status_path(job_id: str) -> Path: return LOG_DIR / f"{job_id}.status"
 
 
-def write_log(batch_id: str, msg: str):
+def write_log(job_id: str, msg: str):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line      = f"[{timestamp}] {msg}\n"
     print(line, end="")
-    with open(_log_path(batch_id), "a", encoding="utf-8") as f:
+    with open(_log_path(job_id), "a", encoding="utf-8") as f:
         f.write(line)
 
 
-def read_logs(batch_id: str) -> list:
-    path = _log_path(batch_id)
+def read_logs(job_id: str) -> list:
+    path = _log_path(job_id)
     if not path.exists():
         return []
     with open(path, "r", encoding="utf-8") as f:
@@ -72,18 +86,18 @@ def _status_safe_value(value):
     return value
 
 
-def write_status(batch_id: str, result: dict):
+def write_status(job_id: str, result: dict):
     safe = {
         k: _status_safe_value(v)
         for k, v in result.items()
         if k != "excel_bytes"
     }
-    with open(_status_path(batch_id), "w", encoding="utf-8") as f:
+    with open(_status_path(job_id), "w", encoding="utf-8") as f:
         json.dump(safe, f, indent=2, default=str)
 
 
-def read_status(batch_id: str) -> dict:
-    path = _status_path(batch_id)
+def read_status(job_id: str) -> dict:
+    path = _status_path(job_id)
     if not path.exists():
         return None
     try:
@@ -93,8 +107,8 @@ def read_status(batch_id: str) -> dict:
         return None
 
 
-def cleanup_batch_files(batch_id: str):
-    for path in [_log_path(batch_id), _status_path(batch_id)]:
+def cleanup_batch_files(job_id: str):
+    for path in [_log_path(job_id), _status_path(job_id)]:
         try:
             if path.exists():
                 path.unlink()
@@ -139,66 +153,78 @@ def cleanup_submit_status(job_id: str):
 
 # ── Submit ────────────────────────────────────────────────────────────────────
 
-def submit_batch(uploaded_files: list, user_email: str = None) -> dict:
+def submit_batch(uploaded_files: list, user_email: str = None, job_id: str = None) -> dict:
     """
-    Submits one Batch API request per uploaded PDF, all inside a single batch job.
-    Keeping requests per-file (rather than one combined request for every file)
-    keeps each response well under MAX_TOKENS and stops one file from truncating
-    the whole job's output.
+    Submits each file's content as one or more separate Batch API jobs — one
+    job per chunk (see build_file_content_chunks / MAX_FALLBACK_PAGES_PER_REQUEST),
+    rather than bundling everything into a single job with multiple requests.
+    Each chunk's client.beta.messages.batches.create() call is a genuine
+    network I/O wait, giving real breathing room between bursts of local
+    CPU-bound work (page rendering, image encoding) on CPU-constrained
+    hosts — more reliable than an in-process sleep between chunks.
+
+    job_id: if given, logs progress as submission happens (each chunk as
+    it's built and submitted), not only after the fact.
 
     Returns:
-        dict: success, batch_id, fallback_files, extraction_notes, error, user_email
+        dict: success, batch_ids (list), fallback_files, extraction_notes, error, user_email, total_pages
     """
-    client   = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
-    batch_id = None
+    client    = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
+    batch_ids = []
+
+    def log(msg):
+        if job_id:
+            write_log(job_id, msg)
 
     try:
-        # Build content — no batch_id yet so no log writes during build
         ts               = datetime.now().strftime('%Y%m%d_%H%M%S')
-        requests         = []
         fallback_files   = []
         extraction_notes = []
         total_pages      = 0
+        req_idx          = 0
 
-        for idx, f in enumerate(uploaded_files, 1):
-            built = build_file_content(f)
+        for f in uploaded_files:
+            built = build_file_content_chunks(f, log_fn=log)
             total_pages += built["page_count"]
             if built["fallback_pages"] > 0:
                 fallback_files.append(f.name)
             if built["notes"]:
                 extraction_notes.extend(built["notes"])
 
-            content = built["content"] + [{"type": "text", "text": config.EXTRACTION_PROMPT}]
-            requests.append({
-                "custom_id": f"invoice_run_{ts}_{idx}",
-                "params": {
-                    "model":      config.MODEL,
-                    "max_tokens": config.BATCH_MAX_TOKENS,
-                    "messages":   [{"role": "user", "content": content}],
-                },
-            })
+            n_chunks = len(built["chunks"])
+            for chunk_idx, chunk_content in enumerate(built["chunks"]):
+                req_idx += 1
+                content = chunk_content + [{"type": "text", "text": config.EXTRACTION_PROMPT}]
 
-        # The output-300k beta raises the per-request max_tokens cap on the
-        # Batch API (Sonnet 4.6 and others) from the standard 128k up to
-        # 300k — retrieval doesn't need the beta header, only submission does.
-        batch = client.beta.messages.batches.create(
-            betas=["output-300k-2026-03-24"],
-            requests=requests,
-        )
-        batch_id = batch.id
+                # The output-300k beta raises the per-request max_tokens cap
+                # on the Batch API (Sonnet 4.6 and others) from the standard
+                # 128k up to 300k — retrieval doesn't need the beta header,
+                # only submission does.
+                batch = client.beta.messages.batches.create(
+                    betas=["output-300k-2026-03-24"],
+                    requests=[{
+                        "custom_id": f"invoice_run_{ts}_{req_idx}",
+                        "params": {
+                            "model":      config.MODEL,
+                            "max_tokens": config.BATCH_MAX_TOKENS,
+                            "messages":   [{"role": "user", "content": content}],
+                        },
+                    }],
+                )
+                batch_ids.append(batch.id)
+                log(f"{f.name} chunk {chunk_idx + 1}/{n_chunks} → submitted as {batch.id}")
 
-        # Write initial log now that we have a batch_id
-        write_log(batch_id, f"Batch submitted | files: {len(uploaded_files)} | requests: {len(requests)}")
+        log(f"All chunks submitted | files: {len(uploaded_files)} | batch jobs: {len(batch_ids)}")
         if fallback_files:
-            write_log(batch_id, f"Image fallback used for at least one page in: {', '.join(fallback_files)}")
+            log(f"Image fallback used for at least one page in: {', '.join(fallback_files)}")
         if extraction_notes:
             for note in extraction_notes:
-                write_log(batch_id, f"Note: {note}")
+                log(f"Note: {note}")
+        log(f"User: {user_email or 'unknown'}")
 
-        write_log(batch_id, f"User: {user_email or 'unknown'}")
         return {
             "success":          True,
-            "batch_id":         batch_id,
+            "batch_ids":        batch_ids,
             "fallback_files":   fallback_files,
             "extraction_notes": extraction_notes,
             "error":            None,
@@ -207,9 +233,12 @@ def submit_batch(uploaded_files: list, user_email: str = None) -> dict:
         }
 
     except Exception:
+        # Any batch_ids already submitted before the failure are left as-is
+        # (not polled/retrieved) — they'll simply expire per Anthropic's
+        # retention policy. The credit reservation gets refunded regardless.
         return {
             "success":          False,
-            "batch_id":         None,
+            "batch_ids":        batch_ids,
             "fallback_files":   [],
             "extraction_notes": [],
             "error":            traceback.format_exc(),
@@ -219,7 +248,7 @@ def submit_batch(uploaded_files: list, user_email: str = None) -> dict:
 def _submit_batch_worker(job_id: str, uploaded_files: list, user_email: str = None):
     """Background thread target — runs submit_batch() and writes the result
     to a submit_<job_id>.status file for app.py to poll."""
-    result = submit_batch(uploaded_files, user_email=user_email)
+    result = submit_batch(uploaded_files, user_email=user_email, job_id=job_id)
     write_submit_status(job_id, result)
 
 
@@ -242,7 +271,8 @@ def start_submission_thread(job_id: str, uploaded_files: list, user_email: str =
 # ── Poll ──────────────────────────────────────────────────────────────────────
 
 def poll_until_done(
-    batch_id: str,
+    job_id: str,
+    batch_ids: list,
     file_count: int,
     user_email: str = None,
     total_pages: int = None,
@@ -251,70 +281,78 @@ def poll_until_done(
 ):
     """
     Background daemon thread.
-    Polls batch status — writes ONLY to log/status files, never session_state.
+    Polls every batch job in batch_ids (a file with many fallback pages can
+    produce several — see submit_batch) until all have ended, then retrieves
+    and merges their results. Writes ONLY to log/status files, never
+    session_state. Keyed throughout by job_id (credit_job_id), not by any
+    single Anthropic batch_id — job_id exists before submission even starts
+    and stays constant regardless of how many batch jobs this file needed.
     """
     client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
 
-    write_log(batch_id, f"Polling started | interval: {config.POLL_INTERVAL_SECONDS}s")
+    write_log(job_id, f"Polling started for {len(batch_ids)} batch job(s) | interval: {config.POLL_INTERVAL_SECONDS}s")
 
-    while True:
-        try:
-            batch  = client.messages.batches.retrieve(batch_id)
-            counts = batch.request_counts
-
-            write_log(
-                batch_id,
-                f"Status: {batch.processing_status} | "
-                f"Processing: {counts.processing} | "
-                f"Succeeded: {counts.succeeded} | "
-                f"Errored: {counts.errored}"
-            )
-
-            if batch.processing_status == "ended":
-                write_log(batch_id, "Batch ended — retrieving results...")
-                result = retrieve_results(
-                    batch_id,
-                    file_count,
-                    client,
-                    user_email=user_email,
-                    total_pages=total_pages,
-                    upload_dup_warnings=upload_dup_warnings,
+    pending = set(batch_ids)
+    while pending:
+        for bid in list(pending):
+            try:
+                batch  = client.messages.batches.retrieve(bid)
+                counts = batch.request_counts
+                write_log(
+                    job_id,
+                    f"{bid}: {batch.processing_status} | "
+                    f"Processing: {counts.processing} | "
+                    f"Succeeded: {counts.succeeded} | "
+                    f"Errored: {counts.errored}"
                 )
+                if batch.processing_status == "ended":
+                    pending.discard(bid)
+            except Exception:
+                write_log(job_id, f"Poll error for {bid}:\n{traceback.format_exc()}")
 
-                if credit_job_id:
-                    if result["success"]:
-                        credit_result = finalize_credit_reservation(credit_job_id)
-                        result["credit_finalized"] = credit_result["success"]
-                        result["credit_error"] = None if credit_result["success"] else credit_result.get("error")
-                    else:
-                        credit_result = refund_credit_reservation(
-                            credit_job_id,
-                            reason=result.get("error") or "Batch processing failed",
-                        )
-                        result["credit_refunded"] = credit_result["success"]
-                        result["credit_error"] = None if credit_result["success"] else credit_result.get("error")
+        if pending:
+            time.sleep(config.POLL_INTERVAL_SECONDS)
 
-                write_status(batch_id, result)
+    write_log(job_id, "All batch jobs ended — retrieving results...")
+    result = retrieve_results(
+        job_id,
+        batch_ids,
+        file_count,
+        client,
+        user_email=user_email,
+        total_pages=total_pages,
+        upload_dup_warnings=upload_dup_warnings,
+    )
 
-                if result["success"]:
-                    write_log(
-                        batch_id,
-                        f"Complete | {len(result.get('items', []))} items | "
-                        f"Cost: ${result['cost']['total_cost_usd']:.4f} | "
-                        f"Email: {'sent' if result.get('email_sent') else 'FAILED'}"
-                    )
-                else:
-                    write_log(batch_id, f"FAILED: {result.get('error')}")
-                return
+    if credit_job_id:
+        if result["success"]:
+            credit_result = finalize_credit_reservation(credit_job_id)
+            result["credit_finalized"] = credit_result["success"]
+            result["credit_error"] = None if credit_result["success"] else credit_result.get("error")
+        else:
+            credit_result = refund_credit_reservation(
+                credit_job_id,
+                reason=result.get("error") or "Batch processing failed",
+            )
+            result["credit_refunded"] = credit_result["success"]
+            result["credit_error"] = None if credit_result["success"] else credit_result.get("error")
 
-        except Exception:
-            write_log(batch_id, f"Poll error:\n{traceback.format_exc()}")
+    write_status(job_id, result)
 
-        time.sleep(config.POLL_INTERVAL_SECONDS)
+    if result["success"]:
+        write_log(
+            job_id,
+            f"Complete | {len(result.get('items', []))} items | "
+            f"Cost: ${result['cost']['total_cost_usd']:.4f} | "
+            f"Email: {'sent' if result.get('email_sent') else 'FAILED'}"
+        )
+    else:
+        write_log(job_id, f"FAILED: {result.get('error')}")
 
 
 def start_polling_thread(
-    batch_id: str,
+    job_id: str,
+    batch_ids: list,
     file_count: int,
     user_email: str = None,
     total_pages: int = None,
@@ -323,7 +361,7 @@ def start_polling_thread(
 ) -> threading.Thread:
     t = threading.Thread(
         target=poll_until_done,
-        args=(batch_id, file_count, user_email, total_pages, credit_job_id, upload_dup_warnings),
+        args=(job_id, batch_ids, file_count, user_email, total_pages, credit_job_id, upload_dup_warnings),
         daemon=True,
     )
     t.start()
@@ -333,13 +371,23 @@ def start_polling_thread(
 # ── Retrieve results ──────────────────────────────────────────────────────────
 
 def retrieve_results(
-    batch_id: str,
+    job_id: str,
+    batch_ids: list,
     file_count: int,
     client=None,
     user_email: str = None,
     total_pages: int = None,
     upload_dup_warnings: list = None,
 ) -> dict:
+    """
+    Retrieves and merges results across every batch job in batch_ids (a file
+    with many fallback pages can produce several — see submit_batch). Each
+    batch's results are just custom_id-keyed requests either way, so merging
+    across batch jobs is no different from merging across the requests
+    within a single one — this function already looped over multiple
+    requests before chunking existed, just now across more than one
+    underlying batch_id too.
+    """
     if client is None:
         client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
 
@@ -349,39 +397,41 @@ def retrieve_results(
         all_items           = []
         errors              = []
 
-        for result in client.messages.batches.results(batch_id):
-            if result.result.type == "succeeded":
-                message = result.result.message
-                total_input_tokens  += message.usage.input_tokens
-                total_output_tokens += message.usage.output_tokens
+        for batch_id in batch_ids:
+            for result in client.messages.batches.results(batch_id):
+                if result.result.type == "succeeded":
+                    message = result.result.message
+                    total_input_tokens  += message.usage.input_tokens
+                    total_output_tokens += message.usage.output_tokens
 
-                raw_text    = message.content[0].text
-                stop_reason = message.stop_reason
+                    raw_text    = message.content[0].text
+                    stop_reason = message.stop_reason
 
-                if stop_reason == "max_tokens":
-                    err = (
-                        f"Output truncated for {result.custom_id} — Claude hit the "
-                        f"max_tokens limit ({config.BATCH_MAX_TOKENS}) for this single file. "
-                        f"Raise BATCH_MAX_TOKENS (up to 300000) if this file has an "
-                        f"unusually large number of line items."
-                    )
+                    if stop_reason == "max_tokens":
+                        err = (
+                            f"Output truncated for {result.custom_id} — Claude hit the "
+                            f"max_tokens limit ({config.BATCH_MAX_TOKENS}) for this chunk. "
+                            f"Raise BATCH_MAX_TOKENS (up to 300000), or lower "
+                            f"MAX_FALLBACK_PAGES_PER_REQUEST if this chunk had an unusually "
+                            f"large number of line items."
+                        )
+                        errors.append(err)
+                        write_log(job_id, f"WARNING: {err}")
+                        continue
+
+                    try:
+                        items = parse_json_response(raw_text, token_limit=config.BATCH_MAX_TOKENS)
+                        all_items.extend(items)
+                        write_log(job_id, f"Parsed {len(items)} items from {result.custom_id}")
+                    except ValueError as e:
+                        err = f"Parse error {result.custom_id}: {e}"
+                        errors.append(err)
+                        write_log(job_id, f"WARNING: {err}")
+
+                elif result.result.type == "errored":
+                    err = f"Request {result.custom_id} errored: {result.result.error.type}"
                     errors.append(err)
-                    write_log(batch_id, f"WARNING: {err}")
-                    continue
-
-                try:
-                    items = parse_json_response(raw_text, token_limit=config.BATCH_MAX_TOKENS)
-                    all_items.extend(items)
-                    write_log(batch_id, f"Parsed {len(items)} items from {result.custom_id}")
-                except ValueError as e:
-                    err = f"Parse error {result.custom_id}: {e}"
-                    errors.append(err)
-                    write_log(batch_id, f"WARNING: {err}")
-
-            elif result.result.type == "errored":
-                err = f"Request {result.custom_id} errored: {result.result.error.type}"
-                errors.append(err)
-                write_log(batch_id, f"ERROR: {err}")
+                    write_log(job_id, f"ERROR: {err}")
 
         if not all_items:
             return {
@@ -392,11 +442,15 @@ def retrieve_results(
                 "total_pages": total_pages or file_count,
             }
 
-        # Deduplicate by invoice number
+        # Deduplicate by invoice number — also the safety net for the rare
+        # case where the same page's items ever appeared in more than one
+        # chunk (shouldn't happen: build_file_content_chunks puts each page
+        # in exactly one chunk, but exact-duplicate line items are skipped
+        # either way if it ever does).
         all_items, dup_warnings = deduplicate_items(all_items)
         if dup_warnings:
             for w in dup_warnings:
-                write_log(batch_id, f"DUP WARNING: {w}")
+                write_log(job_id, f"DUP WARNING: {w}")
 
         # Re-number sr_no
         for idx, item in enumerate(all_items, 1):
@@ -413,7 +467,7 @@ def retrieve_results(
         }
 
         write_log(
-            batch_id,
+            job_id,
             f"Cost: ${batch_cost['total_cost_usd']:.4f} batch | "
             f"${realtime_cost['total_cost_usd']:.4f} real-time | "
             f"Saved: ${realtime_cost['total_cost_usd'] - batch_cost['total_cost_usd']:.4f}"
@@ -423,7 +477,7 @@ def retrieve_results(
         excel_bytes      = create_excel(all_items, dup_warnings or None)
         tally_erp9_bytes = create_tally_xml(all_items, "erp9")
         tally_prime_bytes = create_tally_xml(all_items, "prime")
-        write_log(batch_id, "Excel and Tally XML files created")
+        write_log(job_id, "Excel and Tally XML files created")
 
         email_ok, email_result = send_email(
             excel_bytes       = excel_bytes,
@@ -435,12 +489,12 @@ def retrieve_results(
             dup_warnings      = dup_warnings or None,
             upload_dup_warnings = upload_dup_warnings or None,
             realtime_cost     = realtime_cost,
-            batch_id          = batch_id,
+            batch_id          = ", ".join(batch_ids),
             tally_erp9_bytes  = tally_erp9_bytes,
             tally_prime_bytes = tally_prime_bytes,
         )
         write_log(
-            batch_id,
+            job_id,
             f"Email: {'email sent ' if email_ok else 'FAILED — ' + str(email_result)}"
         )
 
@@ -461,7 +515,7 @@ def retrieve_results(
 
     except Exception:
         err = traceback.format_exc()
-        write_log(batch_id, f"retrieve_results FATAL:\n{err}")
+        write_log(job_id, f"retrieve_results FATAL:\n{err}")
         return {
             "success": False, "items": [], "cost": None,
             "realtime_cost": None, "dup_warnings": [],

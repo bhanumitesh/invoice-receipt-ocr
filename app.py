@@ -81,7 +81,7 @@ auth_defaults = {
 }
 
 batch_defaults = {
-    "batch_id":                    None,
+    "batch_ids":                   None,
     "batch_submitted":             False,
     "submission_started":          False,
     "file_count":                  0,
@@ -675,7 +675,7 @@ if st.session_state["submission_started"] and not st.session_state["batch_submit
         cleanup_submit_status(credit_job_id)
 
         if submit_status["success"]:
-            st.session_state["batch_id"]           = submit_status["batch_id"]
+            st.session_state["batch_ids"]          = submit_status["batch_ids"]
             st.session_state["batch_submitted"]    = True
             st.session_state["submission_started"] = False
             st.session_state["batch_total_pages"]  = (
@@ -684,7 +684,8 @@ if st.session_state["submission_started"] and not st.session_state["batch_submit
             st.session_state["processing"]        = False
             st.session_state["process_requested"] = False
             start_polling_thread(
-                submit_status["batch_id"],
+                credit_job_id,
+                submit_status["batch_ids"],
                 st.session_state["file_count"],
                 user_email=user_email,
                 total_pages=st.session_state["batch_total_pages"],
@@ -707,16 +708,20 @@ if st.session_state["submission_started"] and not st.session_state["batch_submit
 #  BATCH FLOW — STATUS DISPLAY
 # ══════════════════════════════════════════════════════════════════════════════
 
-if st.session_state["batch_submitted"] and st.session_state["batch_id"]:
+if st.session_state["batch_submitted"] and st.session_state["batch_ids"]:
 
-    batch_id   = st.session_state["batch_id"]
-    file_count = st.session_state["file_count"]
+    credit_job_id = st.session_state["credit_job_id"]
+    batch_ids     = st.session_state["batch_ids"]
+    file_count    = st.session_state["file_count"]
 
     st.divider()
     st.subheader("📦 Batch Job")
-    st.caption(f"Batch ID: `{batch_id}`")
+    if len(batch_ids) == 1:
+        st.caption(f"Batch ID: `{batch_ids[0]}`")
+    else:
+        st.caption(f"Batch IDs ({len(batch_ids)} parts): `{'`, `'.join(batch_ids)}`")
 
-    status  = read_status(batch_id)
+    status  = read_status(credit_job_id)
     is_done = status is not None
 
     if not is_done:
@@ -808,7 +813,7 @@ if st.session_state["batch_submitted"] and st.session_state["batch_id"]:
 
         st.divider()
         if st.button("🔄 Process another batch", use_container_width=True, type="primary"):
-            cleanup_batch_files(batch_id)
+            cleanup_batch_files(credit_job_id)
             for k, v in batch_defaults.items():
                 st.session_state[k] = v
             st.rerun()
@@ -823,7 +828,7 @@ if st.session_state["batch_submitted"] and st.session_state["batch_id"]:
             st.code(status.get("error", "Unknown error"))
 
         if st.button("🔄 Try again", use_container_width=True):
-            cleanup_batch_files(batch_id)
+            cleanup_batch_files(credit_job_id)
             for k, v in batch_defaults.items():
                 st.session_state[k] = v
             st.rerun()
