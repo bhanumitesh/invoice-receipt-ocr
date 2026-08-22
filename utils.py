@@ -401,18 +401,19 @@ def build_file_content(f, log_fn=None) -> dict:
             + ")"
         )
 
+    payload_bytes = sum(len(b["text"]) for b in content if b["type"] == "text")
+
     for page_num, pil_image in extraction.get("fallback_images", []):
         buf = io.BytesIO()
-        pil_image.save(buf, format="PNG")
+        pil_image.convert("RGB").save(buf, format="JPEG", quality=config.IMAGE_JPEG_QUALITY)
         b64_data = base64.standard_b64encode(buf.getvalue()).decode("utf-8")
-        content.append({
-            "type": "text",
-            "text": f"=== FILE: {f.name} — PAGE {page_num} (image below) ===",
-        })
+        page_header = f"=== FILE: {f.name} — PAGE {page_num} (image below) ==="
+        content.append({"type": "text", "text": page_header})
         content.append({
             "type": "image",
-            "source": {"type": "base64", "media_type": "image/png", "data": b64_data},
+            "source": {"type": "base64", "media_type": "image/jpeg", "data": b64_data},
         })
+        payload_bytes += len(page_header) + len(b64_data)
         log(f"{f.name} page {page_num} → image fallback (handwriting/stamp detected, or OCR unavailable)")
 
     if not content:
@@ -426,7 +427,18 @@ def build_file_content(f, log_fn=None) -> dict:
             "source": {"type": "base64", "media_type": "application/pdf", "data": b64_data},
             "title": f.name,
         })
+        payload_bytes += len(b64_data)
         log(f"{f.name} → whole-file PDF fallback (extraction produced no usable content)")
+
+    payload_mb = payload_bytes / 1024 / 1024
+    if payload_mb > config.MAX_REQUEST_PAYLOAD_MB:
+        raise ValueError(
+            f"{f.name} is too large to process in one request "
+            f"({payload_mb:.1f}MB of image/text content, limit is "
+            f"{config.MAX_REQUEST_PAYLOAD_MB:.0f}MB) — this happens with scanned "
+            f"files that have many pages needing image fallback (handwriting/stamps, "
+            f"or local OCR unavailable). Try splitting this file into smaller uploads."
+        )
 
     return {
         "content":        content,

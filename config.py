@@ -122,6 +122,20 @@ HANDWRITING_INK_THRESHOLD = float(_optional("HANDWRITING_INK_THRESHOLD", "0.005"
 # accuracy on the fallback path is the whole reason that path exists.
 OCR_RENDER_RESOLUTION_DPI = int(_optional("OCR_RENDER_RESOLUTION_DPI", "200"))
 
+# Images sent to Claude are JPEG (not PNG) — PNG's lossless compression is a
+# poor fit for noisy photographic scan content and can run 3x+ larger than a
+# JPEG at this quality for the same page, which matters because the whole
+# request (all images + text) must fit under Anthropic's 32MB request-size
+# limit. Real 20-page fully-scanned files have been observed at 35MB+ as PNG
+# vs ~10MB as JPEG at this quality.
+IMAGE_JPEG_QUALITY = int(_optional("IMAGE_JPEG_QUALITY", "85"))
+
+# Safety margin under Anthropic's 32MB hard request-size limit — a file whose
+# combined content (text + all fallback images) still exceeds this after JPEG
+# compression fails clearly with a "file too large" error instead of being
+# submitted and rejected by the API with an opaque error.
+MAX_REQUEST_PAYLOAD_MB = float(_optional("MAX_REQUEST_PAYLOAD_MB", "25"))
+
 # ── Extraction prompt ──────────────────────────────────────────────────────
 # Uses abbreviated JSON keys to minimise output tokens.
 # Key map (used in utils.py to expand back to full names for Excel):
