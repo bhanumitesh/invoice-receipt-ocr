@@ -12,6 +12,8 @@ import time
 import traceback
 from datetime import datetime
 
+import cv2
+import numpy as np
 import resend
 
 import pdfplumber
@@ -259,6 +261,144 @@ def _encode_page_jpeg(pil_image) -> bytes:
     buf = io.BytesIO()
     pil_image.convert("RGB").save(buf, format="JPEG", quality=config.IMAGE_JPEG_QUALITY)
     return buf.getvalue()
+
+
+# ── Document auto-crop (camera captures only) ─────────────────────────────────
+#
+#  Adobe Scan-style automatic edge detection: find the document's 4 corners in
+#  a captured photo and perspective-warp just that region, dropping whatever
+#  background/desk/hand is around it. There's no live camera feed available
+#  through st.camera_input() (it only hands back the final snapped photo), so
+#  this runs once, right after capture — the corners get drawn on the original
+#  photo as a post-capture confirmation, while the actual page sent for
+#  extraction is the cropped, flattened version. A low-confidence detection
+#  (poor contrast, cluttered background, no clear rectangle) silently falls
+#  back to the untouched photo rather than risking a bad crop.
+
+def _order_corners(pts: np.ndarray) -> np.ndarray:
+    """Orders 4 points as top-left, top-right, bottom-right, bottom-left."""
+    rect = np.zeros((4, 2), dtype="float32")
+    total = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(total)]
+    rect[2] = pts[np.argmax(total)]
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
+    return rect
+
+
+def detect_document_corners(pil_image):
+    """
+    Looks for a document-shaped quadrilateral in a captured photo. Returns an
+    ordered 4x2 float array of (x, y) corners in the original image's
+    coordinate space, or None if nothing confident enough was found.
+    """
+    img = np.array(pil_image.convert("RGB"))
+    h, w = img.shape[:2]
+
+    # Downscale for speed — edge detection doesn't need full resolution, and
+    # this runs on a single CPU-constrained host.
+    scale = 1000.0 / max(h, w) if max(h, w) > 1000 else 1.0
+    small = cv2.resize(img, (int(w * scale), int(h * scale))) if scale != 1.0 else img
+
+    gray = cv2.cvtColor(small, cv2.COLOR_RGB2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edged = cv2.dilate(cv2.Canny(blurred, 50, 150), None, iterations=1)
+
+    contours, _ = cv2.findContours(edged, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    small_area = small.shape[0] * small.shape[1]
+    for contour in sorted(contours, key=cv2.contourArea, reverse=True)[:5]:
+        peri = cv2.arcLength(contour, True)
+        approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
+        if len(approx) != 4:
+            continue
+        area_frac = cv2.contourArea(approx) / small_area
+        # Lower bound: a small/irrelevant quadrilateral (a corner of a table,
+        # a shadow) isn't the document. Upper bound: on a noisy/busy frame,
+        # findContours can pick up the image's own border as a "4-point"
+        # contour spanning ~all of it — a real photographed document is held
+        # with visible background margin around it, so near-full-frame is a
+        # detection artifact, not a document.
+        if 0.2 < area_frac < 0.92:
+            corners = approx.reshape(4, 2).astype("float32") / scale
+            return _order_corners(corners)
+
+    return None
+
+
+def crop_to_document(pil_image, corners):
+    """Perspective-warps the image so the given 4 corners become a flat rectangle."""
+    img = np.array(pil_image.convert("RGB"))
+    tl, tr, br, bl = corners
+
+    max_width = max(int(np.linalg.norm(br - bl)), int(np.linalg.norm(tr - tl)))
+    max_height = max(int(np.linalg.norm(tr - br)), int(np.linalg.norm(tl - bl)))
+    if max_width < 10 or max_height < 10:
+        return pil_image  # degenerate quad — bail out rather than a sliver crop
+
+    dst = np.array([
+        [0, 0],
+        [max_width - 1, 0],
+        [max_width - 1, max_height - 1],
+        [0, max_height - 1],
+    ], dtype="float32")
+
+    matrix = cv2.getPerspectiveTransform(corners, dst)
+    warped = cv2.warpPerspective(img, matrix, (max_width, max_height))
+    return Image.fromarray(warped)
+
+
+def _draw_corner_overlay_jpeg(pil_image, corners) -> bytes:
+    """Draws the detected outline on a copy of the photo, for a post-capture
+    visual confirmation of what got picked up — not the cropped image itself."""
+    img = np.array(pil_image.convert("RGB")).copy()
+    pts = corners.astype(int)
+    thickness = max(2, img.shape[1] // 250)
+    cv2.polylines(img, [pts], isClosed=True, color=(0, 255, 0), thickness=thickness)
+    for (x, y) in pts:
+        cv2.circle(img, (int(x), int(y)), max(4, img.shape[1] // 150), (0, 255, 0), -1)
+    buf = io.BytesIO()
+    Image.fromarray(img).save(buf, format="JPEG", quality=config.IMAGE_JPEG_QUALITY)
+    return buf.getvalue()
+
+
+def process_captured_page(img_bytes: bytes) -> dict:
+    """
+    Runs auto-crop detection on a freshly captured photo. Returns:
+        {
+            "submit":  bytes  — page to send for extraction (cropped if detected)
+            "preview": bytes  — photo for the UI thumbnail (corners drawn on if detected)
+            "cropped": bool   — whether a confident detection was found
+        }
+    Falls back to the untouched original for both "submit" and "preview" when
+    detection fails or the captured bytes aren't a decodable image — forcing a
+    bad crop is worse than sending the full photo.
+    """
+    try:
+        pil_image = Image.open(io.BytesIO(img_bytes))
+        pil_image.load()
+    except Exception:
+        return {"submit": img_bytes, "preview": img_bytes, "cropped": False}
+
+    try:
+        corners = detect_document_corners(pil_image)
+    except Exception:
+        corners = None
+
+    if corners is None:
+        return {"submit": img_bytes, "preview": img_bytes, "cropped": False}
+
+    try:
+        preview_bytes = _draw_corner_overlay_jpeg(pil_image, corners)
+        cropped_image = crop_to_document(pil_image, corners)
+        buf = io.BytesIO()
+        cropped_image.convert("RGB").save(buf, format="JPEG", quality=config.IMAGE_JPEG_QUALITY)
+        return {"submit": buf.getvalue(), "preview": preview_bytes, "cropped": True}
+    except Exception:
+        return {"submit": img_bytes, "preview": img_bytes, "cropped": False}
 
 
 # ── PDF text extraction ───────────────────────────────────────────────────────

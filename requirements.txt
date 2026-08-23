@@ -6,3 +6,5 @@ python-dotenv>=1.0.0
 resend>=2.0.0
 supabase>=2.0.0
 pytesseract>=0.3.10
+opencv-python-headless>=4.9.0
+numpy>=1.26.0

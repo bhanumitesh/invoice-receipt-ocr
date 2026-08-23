@@ -39,6 +39,11 @@ installed separately on the host:
   tesseract-ocr` in the build step) — check Render's current docs for
   installing apt packages on your plan.
 
+(Document auto-crop for camera-captured pages uses `opencv-python-headless`,
+which — unlike Tesseract — is a pure pip package with no separate system
+binary to install; it works the same in local dev and on Render out of the
+box.)
+
 If Tesseract isn't installed, the app still works correctly — it just always
 falls back to sending scanned pages to Claude as images instead of using
 local OCR (the pre-OCR behavior).

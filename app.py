@@ -42,7 +42,7 @@ from db import (
     revoke_session,
 )
 from realtime_processor import process_realtime
-from utils import count_uploaded_pdf_pages, create_excel, detect_duplicate_uploads, send_email
+from utils import count_uploaded_pdf_pages, create_excel, detect_duplicate_uploads, process_captured_page, send_email
 
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -99,7 +99,7 @@ batch_defaults = {
 # own session-state, its own job list, so scanning and uploading can be used
 # together without interfering with each other.
 scan_defaults = {
-    "scan_buffer":              [],     # captured page bytes not yet finalized into a batch
+    "scan_buffer":              [],     # captured pages not yet finalized into a batch — each a dict from process_captured_page()
     "scan_capture_count":       0,      # bumped to force a fresh camera_input widget after each capture/finalize
     "scan_local_build_active":  False,  # serialization gate — only one batch's local build+submit runs at a time
     "scan_jobs":                [],     # every scan batch created this session, in any state
@@ -533,7 +533,7 @@ elif page_count_error:
 
 def _scan_finalize_batch():
     """Reserves credits and queues the current scan_buffer as a new batch in the session."""
-    images = st.session_state["scan_buffer"]
+    images = [page["submit"] for page in st.session_state["scan_buffer"]]
     page_count = len(images)
     credit_job_id = f"scan_{uuid.uuid4().hex}"
 
@@ -675,7 +675,8 @@ if not st.session_state["scan_session_finalizing"]:
         key=f"scan_cam_{st.session_state['scan_capture_count']}",
     )
     if scan_capture is not None:
-        st.session_state["scan_buffer"].append(scan_capture.getvalue())
+        processed = process_captured_page(scan_capture.getvalue())
+        st.session_state["scan_buffer"].append(processed)
         st.session_state["scan_capture_count"] += 1
         st.session_state["scan_last_activity"] = time.time()
         st.rerun()
@@ -686,9 +687,10 @@ if not st.session_state["scan_session_finalizing"]:
                  f"(auto-submits at {config.SCAN_AUTO_SUBMIT_THRESHOLD}):")
 
         thumb_cols = st.columns(min(len(buffered), 5))
-        for i, img_bytes in enumerate(buffered):
+        for i, page in enumerate(buffered):
             with thumb_cols[i % len(thumb_cols)]:
-                st.image(img_bytes, use_container_width=True)
+                st.image(page["preview"], use_container_width=True)
+                st.caption("✂️ Edges detected" if page["cropped"] else "Full photo used")
                 if st.button("✕ Remove", key=f"scan_remove_{i}"):
                     st.session_state["scan_buffer"].pop(i)
                     st.rerun()
