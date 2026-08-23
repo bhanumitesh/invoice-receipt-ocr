@@ -33,6 +33,7 @@
 # ─────────────────────────────────────────────
 
 import json
+import re
 import threading
 import time
 import traceback
@@ -57,6 +58,11 @@ from utils import (
 # ── Log directory ─────────────────────────────────────────────────────────────
 LOG_DIR = Path("batch_logs")
 LOG_DIR.mkdir(exist_ok=True)
+
+# Matches the page-composition suffix submit_batch() encodes into every
+# custom_id (e.g. "..._t3_i5" or "..._t12_i0_wf") — see submit_batch for why
+# it's embedded there rather than in a separately persisted file.
+CUSTOM_ID_ROUTE_RE = re.compile(r"_t(\d+)_i(\d+)(_wf)?$")
 
 
 # ── Log / status file helpers ─────────────────────────────────────────────────
@@ -251,6 +257,32 @@ def submit_batch(sources: list, user_email: str = None, job_id: str = None) -> d
                 req_idx += 1
                 content = chunk_content + [{"type": "text", "text": config.EXTRACTION_PROMPT}]
 
+                # Page-route composition for this one request, encoded straight
+                # into custom_id rather than a separately persisted file — this
+                # is the only place that survives to retrieval time regardless
+                # of Render restarts (batch_logs/ is ephemeral, but Anthropic
+                # echoes custom_id back verbatim on every result). Only chunk 0
+                # of a source carries its text block (native-extracted + local
+                # OCR pages, combined — see build_file_content_chunks), so text
+                # pages are attributed there; every chunk carries only its own
+                # share of image-fallback pages.
+                is_whole_file_fallback = any(b.get("type") == "document" for b in chunk_content)
+                image_pages_here = sum(1 for b in chunk_content if b.get("type") == "image")
+                if is_whole_file_fallback:
+                    # The whole file is sent as one raw PDF block, not per-page
+                    # text/images — "text_pages_here" here just carries the
+                    # page count for cost-bucketing purposes, tagged _wf below
+                    # so retrieval doesn't confuse it with the OCR/native-text route.
+                    text_pages_here = built["page_count"]
+                elif chunk_idx == 0:
+                    text_pages_here = max(
+                        0,
+                        built["page_count"] - built.get("skipped_pages", 0) - built["fallback_pages"],
+                    )
+                else:
+                    text_pages_here = 0
+                route_suffix = "_wf" if is_whole_file_fallback else ""
+
                 # The output-300k beta raises the per-request max_tokens cap
                 # on the Batch API from a model's standard cap up to 300k —
                 # but only for models Anthropic has confirmed support it (see
@@ -271,7 +303,7 @@ def submit_batch(sources: list, user_email: str = None, job_id: str = None) -> d
 
                 create_kwargs = {
                     "requests": [{
-                        "custom_id": f"invoice_run_{ts}_{req_idx}",
+                        "custom_id": f"invoice_run_{ts}_{req_idx}_t{text_pages_here}_i{image_pages_here}{route_suffix}",
                         "params": {
                             "model":      config.MODEL,
                             "max_tokens": max_tokens,
@@ -596,12 +628,62 @@ def retrieve_results(
         all_items           = []
         errors              = []
 
+        # Per-route cost breakdown. "text" = pages read via native PDF
+        # extraction and/or local OCR (same cost either way — both become a
+        # text block, not image tokens); "image" = pages sent as images
+        # (handwriting/stamps, OCR unavailable, or OCR too sparse); "mixed" =
+        # a request that carried both in one call (only chunk 0 of a source
+        # can, when it has both a text block and its own share of fallback
+        # images) — its cost can't be split further between the two without
+        # guessing, so it's reported as its own bucket rather than forcing an
+        # inaccurate per-page split; "whole_file_pdf" = the rare fallback
+        # where extraction failed entirely and the raw PDF was sent as-is.
+        route_totals = {
+            "text":           {"pages": 0, "requests": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0},
+            "image":          {"pages": 0, "requests": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0},
+            "mixed":          {"text_pages": 0, "image_pages": 0, "requests": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0},
+            "whole_file_pdf": {"pages": 0, "requests": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0},
+        }
+
         for batch_id in batch_ids:
             for result in client.messages.batches.results(batch_id):
                 if result.result.type == "succeeded":
                     message = result.result.message
                     total_input_tokens  += message.usage.input_tokens
                     total_output_tokens += message.usage.output_tokens
+
+                    request_cost = calculate_cost(message.usage.input_tokens, message.usage.output_tokens)
+                    route_match  = CUSTOM_ID_ROUTE_RE.search(result.custom_id)
+                    if route_match:
+                        text_pages, image_pages, is_wf = (
+                            int(route_match.group(1)), int(route_match.group(2)), bool(route_match.group(3))
+                        )
+                        if is_wf:
+                            bucket, desc = "whole_file_pdf", f"{text_pages} page(s), whole-file PDF fallback"
+                        elif text_pages > 0 and image_pages > 0:
+                            bucket, desc = "mixed", f"{text_pages} text + {image_pages} image page(s), mixed"
+                        elif image_pages > 0:
+                            bucket, desc = "image", f"{image_pages} image page(s)"
+                        else:
+                            bucket, desc = "text", f"{text_pages} text page(s)"
+
+                        rt = route_totals[bucket]
+                        rt["requests"]      += 1
+                        rt["input_tokens"]  += message.usage.input_tokens
+                        rt["output_tokens"] += message.usage.output_tokens
+                        rt["cost_usd"]      += request_cost["total_cost_usd"]
+                        if bucket == "mixed":
+                            rt["text_pages"]  += text_pages
+                            rt["image_pages"] += image_pages
+                        else:
+                            rt["pages"] += text_pages if bucket in ("text", "whole_file_pdf") else image_pages
+
+                        write_log(
+                            job_id,
+                            f"Cost {result.custom_id}: {desc} | "
+                            f"{message.usage.input_tokens:,} in / {message.usage.output_tokens:,} out tok | "
+                            f"${request_cost['total_cost_usd']:.4f} ({config.MODEL})"
+                        )
 
                     raw_text    = message.content[0].text
                     stop_reason = message.stop_reason
@@ -677,6 +759,28 @@ def retrieve_results(
             f"${realtime_cost['total_cost_usd']:.4f} real-time | "
             f"Saved: ${realtime_cost['total_cost_usd'] - batch_cost['total_cost_usd']:.4f}"
         )
+
+        # Route breakdown — avg $/page is only meaningful for the pure
+        # buckets (text-only or image-only requests), where a request's
+        # whole cost maps cleanly to one route; "mixed" requests can't be
+        # split further per page, so only their totals are reported.
+        breakdown_parts = []
+        for bucket_name, label in (("text", "Text/OCR"), ("image", "Image"), ("whole_file_pdf", "Whole-file PDF")):
+            rt = route_totals[bucket_name]
+            if rt["requests"] == 0:
+                continue
+            avg = f" (${rt['cost_usd'] / rt['pages']:.4f}/page)" if rt["pages"] else ""
+            breakdown_parts.append(
+                f"{label}: {rt['pages']} page(s), {rt['requests']} req, ${rt['cost_usd']:.4f}{avg}"
+            )
+        mixed = route_totals["mixed"]
+        if mixed["requests"] > 0:
+            breakdown_parts.append(
+                f"Mixed: {mixed['text_pages']} text + {mixed['image_pages']} image page(s), "
+                f"{mixed['requests']} req, ${mixed['cost_usd']:.4f}"
+            )
+        if breakdown_parts:
+            write_log(job_id, f"Cost by route ({config.MODEL}) | " + " | ".join(breakdown_parts))
 
         # Create Excel + Tally XMLs
         excel_bytes      = create_excel(all_items, dup_warnings or None)

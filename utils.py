@@ -752,6 +752,7 @@ def build_file_content_chunks(f, log_fn=None) -> dict:
         "page_count":     page_count,
         "fallback_pages": extraction.get("scanned_pages", 0),
         "ocr_pages":      extraction.get("ocr_pages", 0),
+        "skipped_pages":  extraction.get("skipped_pages", 0),
         "notes":          notes,
     }
 
@@ -896,6 +897,7 @@ def build_captured_pages_content(images: list, name: str = "Scanned pages", log_
         "page_count":     page_count,
         "fallback_pages": scanned_pages,
         "ocr_pages":      ocr_pages,
+        "skipped_pages":  skipped_pages,
         "notes":          notes,
     }
 
