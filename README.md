@@ -136,20 +136,23 @@ Real-time processing code remains in the project, but the UI is temporarily disa
 
 ## Output Files
 
-Every run produces three files:
+Every run produces five files:
 
 | File | Description |
 |---|---|
 | `Invoice_Register.xlsx` | Full register for CA review — all line items, GST breakdown, HSN codes |
-| `Tally_ERP9_Import.xml` | Import into Tally ERP 9 via Gateway → Import Data → Vouchers |
-| `Tally_Prime_Import.xml` | Import into TallyPrime 3.x via Gateway → Import → Data |
+| `Tally_ERP9_LedgerMasters.xml` | **Import this first** — creates any ledgers the vouchers file references that don't already exist in your Tally company |
+| `Tally_ERP9_Import.xml` | Import **second**, via Gateway → Import Data → Vouchers — the actual Journal voucher entries |
+| `Tally_Prime_LedgerMasters.xml` | Same as the ERP 9 masters file, for TallyPrime |
+| `Tally_Prime_Import.xml` | Same as the ERP 9 vouchers file, for TallyPrime |
 
 ### Tally import notes
-- All line items post to the default ledger set in `TALLY_DEFAULT_LEDGER`
-- Reassign to correct ledgers inside Tally after import
-- GST ledgers (CGST, SGST/UTGST, IGST) are created as separate entries automatically
-- Party (vendor) is set as the creditor ledger
-- Both ERP 9 and TallyPrime files are always generated — use whichever applies to your version
+- **Two-step import, in order**: the Ledger Masters file first, then the Vouchers file. Tally's voucher import only *references* ledgers by name — it doesn't create them — so any ledger not already in your Tally company (a new vendor, or the expense/tax ledgers on first use) will make the vouchers import fail unless the masters file has been imported first.
+- Entries are created as **Journal vouchers** (`VCHTYPE="Journal"`), matching how these are actually recorded in practice — not the invoice-style Purchase voucher used in earlier versions of this tool. See [docs/tally-xml-import-design.md](docs/tally-xml-import-design.md) for the full reasoning.
+- All line items post to the single default expense ledger set in `TALLY_DEFAULT_LEDGER`, for every vendor — real-world usage often varies the expense ledger per vendor (e.g. "Repair and Maintenance" vs. "Diesel and Petrol"), which this doesn't do yet; reassign inside Tally after import as needed
+- GST amounts (CGST, SGST/UTGST, IGST) are posted as separate debit lines automatically, only when present on the invoice — see `docs/tally-xml-import-design.md` for why some vendors (e.g. GST-exempt fuel purchases, or Composition Scheme dealers) legitimately have none
+- Party (vendor) is set as the creditor ledger, credited for the invoice total — no bill-wise/outstanding-per-invoice tracking yet (see the design doc's open questions)
+- Both ERP 9 and TallyPrime versions of each file are always generated — use whichever applies to your version
 
 ### Duplicate invoice handling
 - Upload-time precheck skips high-confidence duplicate PDFs before Claude processing

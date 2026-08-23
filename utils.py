@@ -1256,23 +1256,27 @@ def _escape_xml(val) -> str:
 
 def _build_voucher_xml(item: dict, tally_version: str) -> str:
     """
-    Builds a single <VOUCHER> XML block for one invoice line item.
+    Builds a single <VOUCHER> XML block for one invoice line item, as a
+    Journal voucher — matching how these entries are actually recorded in
+    practice (verified against real Tally examples), not an invoice-style
+    Purchase voucher. Journal vouchers don't carry invoice-mode display
+    fields (PARTYGSTIN, BASICBASEPARTYNAME, an "Invoice Voucher View"
+    PERSISTEDVIEW) — the GSTIN is still preserved in the narration text.
+
     tally_version: "erp9" or "prime"
 
-    Both use the same core schema — TallyPrime adds GUID and ALTERID
-    attributes which ERP 9 ignores, so we include them in both for safety.
+    Both use the same core schema — TallyPrime adds a RESERVEDNAME attribute
+    which ERP 9 ignores, so we include it in both for safety.
     """
     date      = _tally_date(item.get("invoice_date", ""))
     party     = _escape_xml(item.get("party_name", ""))
     inv_no    = _escape_xml(item.get("invoice_no",  ""))
-    desc      = _escape_xml(item.get("description", ""))
     narration = _escape_xml(
         f"{item.get('description','')} | Invoice: {item.get('invoice_no','')} "
         f"| GSTIN: {item.get('gstin','') or 'N/A'} "
         f"| HSN: {item.get('hsn_code','') or 'N/A'}"
     )
     ledger    = _escape_xml(config.TALLY_DEFAULT_LEDGER)
-    company   = _escape_xml(config.TALLY_COMPANY_NAME)
 
     # Amounts
     total     = _parse_amount(item.get("total_value"))
@@ -1285,12 +1289,6 @@ def _build_voucher_xml(item: dict, tally_version: str) -> str:
     has_igst  = igst_amt > 0
     has_cgst  = cgst_amt > 0
     has_sgst  = sgst_amt > 0
-
-    # GSTIN for party
-    gstin     = _escape_xml(item.get("gstin") or "")
-
-    # HSN
-    hsn       = _escape_xml(item.get("hsn_code") or "")
 
     # Build ledger entries
     # Credit: Party ledger (creditor — we owe them)
@@ -1352,17 +1350,15 @@ def _build_voucher_xml(item: dict, tally_version: str) -> str:
     prime_attrs = ' RESERVEDNAME=""' if tally_version == "prime" else ""
 
     voucher = f"""
-    <VOUCHER REMOTEID="{inv_no}" VCHTYPE="Purchase" ACTION="Create"{prime_attrs}>
+        <VOUCHER REMOTEID="{inv_no}" VCHTYPE="Journal" ACTION="Create"{prime_attrs}>
         <DATE>{date}</DATE>
         <GUID>{inv_no}-{date}</GUID>
-        <VOUCHERTYPENAME>Purchase</VOUCHERTYPENAME>
+        <VOUCHERTYPENAME>Journal</VOUCHERTYPENAME>
         <VOUCHERNUMBER>{inv_no}</VOUCHERNUMBER>
         <PARTYLEDGERNAME>{party}</PARTYLEDGERNAME>
-        <NARRATION>{narration}</NARRATION>
-        <BASICBASEPARTYNAME>{party}</BASICBASEPARTYNAME>
-        <PARTYGSTIN>{gstin}</PARTYGSTIN>
-        <PERSISTEDVIEW>Invoice Voucher View</PERSISTEDVIEW>{entries_xml}
-    </VOUCHER>"""
+        <ISINVOICE>No</ISINVOICE>
+        <NARRATION>{narration}</NARRATION>{entries_xml}
+        </VOUCHER>"""
 
     return voucher
 
@@ -1383,10 +1379,10 @@ def create_tally_xml(items: list, tally_version: str) -> bytes:
         "Tally ERP 9" if tally_version == "erp9"
         else "TallyPrime 3.x"
     )
-    company = _escape_xml(config.TALLY_COMPANY_NAME)
-
-    vouchers = "".join(
-        _build_voucher_xml(item, tally_version)
+    tally_messages = "".join(
+        f"""
+            <TALLYMESSAGE xmlns:UDF="TallyUDF">{_build_voucher_xml(item, tally_version)}
+            </TALLYMESSAGE>"""
         for item in items
         if _parse_amount(item.get("total_value")) > 0
     )
@@ -1404,11 +1400,106 @@ def create_tally_xml(items: list, tally_version: str) -> bytes:
         <IMPORTDATA>
             <REQUESTDESC>
                 <REPORTNAME>Vouchers</REPORTNAME>
-                <STATICVARIABLES>
-                    <SVCURRENTCOMPANY>{company}</SVCURRENTCOMPANY>
-                </STATICVARIABLES>
             </REQUESTDESC>
-            <REQUESTDATA>{vouchers}
+            <REQUESTDATA>{tally_messages}
+            </REQUESTDATA>
+        </IMPORTDATA>
+    </BODY>
+</ENVELOPE>"""
+
+    return xml.encode("utf-8")
+
+
+def create_tally_ledger_masters_xml(items: list, tally_version: str) -> bytes:
+    """
+    Generates a Tally-importable XML file that creates every ledger master
+    the vouchers from create_tally_xml() will reference: each unique
+    party/vendor, the tax ledgers actually used in this batch (CGST/SGST/
+    IGST), and the single default expense ledger. Tally's voucher import
+    only references ledgers by name — it doesn't create them — so this file
+    is meant to be imported FIRST, before the vouchers file, so every name
+    the vouchers reference already exists.
+
+    Uses the current single config.TALLY_DEFAULT_LEDGER for every vendor's
+    expense line, matching create_tally_xml()'s current behavior. Real-world
+    usage varies the expense category per vendor (e.g. "Repair and
+    Maintenance" vs. "Diesel and Petrol") — not captured here yet; see
+    docs/tally-xml-import-design.md.
+
+    Vendors already existing in the accountant's Tally company are handled
+    by Tally's own duplicate-ledger behavior on import, not detected here —
+    every batch's unique parties are always included, so this file is safe
+    to import repeatedly across batches.
+
+    tally_version: "erp9" or "prime" — kept for interface symmetry with
+    create_tally_xml(); ledger-master creation doesn't currently need any
+    version-specific attributes.
+
+    Returns XML as bytes.
+    """
+    version_comment = (
+        "Tally ERP 9" if tally_version == "erp9"
+        else "TallyPrime 3.x"
+    )
+
+    seen_parties  = set()
+    party_ledgers = []
+    has_igst = has_cgst = has_sgst = False
+
+    for item in items:
+        if _parse_amount(item.get("total_value")) <= 0:
+            continue
+        party = _escape_xml(item.get("party_name", ""))
+        if party and party not in seen_parties:
+            seen_parties.add(party)
+            party_ledgers.append(party)
+        if _parse_amount(item.get("igst")) > 0:
+            has_igst = True
+        if _parse_amount(item.get("cgst")) > 0:
+            has_cgst = True
+        if _parse_amount(item.get("sgst")) > 0:
+            has_sgst = True
+
+    def ledger_block(name: str, parent: str) -> str:
+        return f"""
+            <LEDGER Action="Create">
+                <NAME>{name}</NAME>
+                <PARENT>{parent}</PARENT>
+                <OPENINGBALANCE>0</OPENINGBALANCE>
+            </LEDGER>"""
+
+    ledger_blocks = [ledger_block(_escape_xml(config.TALLY_DEFAULT_LEDGER), "Indirect Expenses")]
+    if has_igst:
+        ledger_blocks.append(ledger_block("IGST", "Duties &amp; Taxes"))
+    if has_cgst:
+        ledger_blocks.append(ledger_block("CGST", "Duties &amp; Taxes"))
+    if has_sgst:
+        ledger_blocks.append(ledger_block("SGST/UTGST", "Duties &amp; Taxes"))
+    for party in party_ledgers:
+        ledger_blocks.append(ledger_block(party, "Sundry Creditors"))
+
+    tally_messages = "".join(
+        f"""
+            <TALLYMESSAGE xmlns:UDF="TallyUDF">{block}
+            </TALLYMESSAGE>"""
+        for block in ledger_blocks
+    )
+
+    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!-- Tally Ledger Masters Import File — {version_comment} -->
+<!-- Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")} -->
+<!-- Import this file FIRST, before the Vouchers import file, so every -->
+<!-- ledger name the vouchers reference already exists. -->
+<ENVELOPE>
+    <HEADER>
+        <TALLYREQUEST>Import Data</TALLYREQUEST>
+    </HEADER>
+    <BODY>
+        <IMPORTDATA>
+            <REQUESTDESC>
+                <REPORTNAME>All Masters</REPORTNAME>
+            </REQUESTDESC>
+            <REQUESTDATA>{tally_messages}
             </REQUESTDATA>
         </IMPORTDATA>
     </BODY>
@@ -1433,6 +1524,8 @@ def send_email(
     batch_id:          str   = None,
     tally_erp9_bytes:  bytes = None,
     tally_prime_bytes: bytes = None,
+    tally_erp9_masters_bytes:  bytes = None,
+    tally_prime_masters_bytes: bytes = None,
 ) -> tuple:
     """
     Sends Excel + both Tally XML files as email attachments via Resend API.
@@ -1483,11 +1576,21 @@ def send_email(
         + dup_section
         + f"\n-- Note --\n"
         f"Attachments:\n"
-        f"  1. Invoice_Register.xlsx  — full register for review\n"
-        + ("  2. Tally_ERP9_Import.xml   — import into Tally ERP 9\n" if tally_erp9_bytes else "")
-        + ("  3. Tally_Prime_Import.xml  — import into TallyPrime 3.x\n" if tally_prime_bytes else "")
+        f"  Invoice_Register.xlsx        — full register for review\n"
+        + (
+            "\n  For Tally ERP 9, import in this order:\n"
+            "    1. Tally_ERP9_LedgerMasters.xml  — creates any missing ledgers\n"
+            "    2. Tally_ERP9_Import.xml         — the actual entries\n"
+            if tally_erp9_bytes else ""
+        )
+        + (
+            "\n  For TallyPrime, import in this order:\n"
+            "    1. Tally_Prime_LedgerMasters.xml — creates any missing ledgers\n"
+            "    2. Tally_Prime_Import.xml        — the actual entries\n"
+            if tally_prime_bytes else ""
+        )
         + f"\nAll values extracted directly from source documents.\n"
-        f"Default ledger used: {config.TALLY_DEFAULT_LEDGER}\n"
+        f"Default expense ledger used: {config.TALLY_DEFAULT_LEDGER}\n"
         f"Reassign ledgers inside Tally after import as needed.\n"
         f"Missing fields are left blank.\n"
         + (f"See 'Duplicate Warnings' sheet in Excel for extracted duplicate invoices.\n" if dup_warnings else "")
@@ -1505,10 +1608,20 @@ def send_email(
     excel_b64   = base64.b64encode(excel_bytes).decode("utf-8")
     attachments = [{"filename": filename, "content": excel_b64}]
 
+    if tally_erp9_masters_bytes:
+        attachments.append({
+            "filename": f"Tally_ERP9_LedgerMasters_{ts}.xml",
+            "content":  base64.b64encode(tally_erp9_masters_bytes).decode("utf-8"),
+        })
     if tally_erp9_bytes:
         attachments.append({
             "filename": f"Tally_ERP9_Import_{ts}.xml",
             "content":  base64.b64encode(tally_erp9_bytes).decode("utf-8"),
+        })
+    if tally_prime_masters_bytes:
+        attachments.append({
+            "filename": f"Tally_Prime_LedgerMasters_{ts}.xml",
+            "content":  base64.b64encode(tally_prime_masters_bytes).decode("utf-8"),
         })
     if tally_prime_bytes:
         attachments.append({

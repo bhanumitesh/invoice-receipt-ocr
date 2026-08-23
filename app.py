@@ -772,33 +772,57 @@ if st.session_state["scan_session_finalizing"]:
                     scan_excel_bytes       = create_excel(items, session_status.get("dup_warnings") or None)
                     scan_tally_erp9_bytes  = session_status.get("tally_erp9_bytes")
                     scan_tally_prime_bytes = session_status.get("tally_prime_bytes")
+                    scan_tally_erp9_masters_bytes  = session_status.get("tally_erp9_masters_bytes")
+                    scan_tally_prime_masters_bytes = session_status.get("tally_prime_masters_bytes")
                     scan_ts                = datetime.now().strftime("%Y%m%d_%H%M%S")
 
                     st.subheader("📥 Download Files")
-                    scan_dl1, scan_dl2, scan_dl3 = st.columns(3)
-                    with scan_dl1:
-                        st.download_button(
-                            label     = "⬇️ Invoice Register (.xlsx)",
-                            data      = scan_excel_bytes,
-                            file_name = f"Invoice_Register_{len(items)}_items.xlsx",
-                            mime      = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            use_container_width = True,
-                        )
+                    st.download_button(
+                        label     = "⬇️ Invoice Register (.xlsx)",
+                        data      = scan_excel_bytes,
+                        file_name = f"Invoice_Register_{len(items)}_items.xlsx",
+                        mime      = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width = True,
+                    )
+
+                    st.caption("Tally import — **Step 1: Ledger Masters** (creates any missing ledgers)")
+                    scan_dlm1, scan_dlm2 = st.columns(2)
+                    with scan_dlm1:
+                        if scan_tally_erp9_masters_bytes:
+                            st.download_button(
+                                label     = "⬇️ ERP 9 — Ledger Masters (.xml)",
+                                data      = scan_tally_erp9_masters_bytes.encode() if isinstance(scan_tally_erp9_masters_bytes, str) else scan_tally_erp9_masters_bytes,
+                                file_name = f"Tally_ERP9_LedgerMasters_{scan_ts}.xml",
+                                mime      = "application/xml",
+                                use_container_width = True,
+                            )
+                    with scan_dlm2:
+                        if scan_tally_prime_masters_bytes:
+                            st.download_button(
+                                label     = "⬇️ TallyPrime — Ledger Masters (.xml)",
+                                data      = scan_tally_prime_masters_bytes.encode() if isinstance(scan_tally_prime_masters_bytes, str) else scan_tally_prime_masters_bytes,
+                                file_name = f"Tally_Prime_LedgerMasters_{scan_ts}.xml",
+                                mime      = "application/xml",
+                                use_container_width = True,
+                            )
+
+                    st.caption("Tally import — **Step 2: Vouchers** (the actual entries)")
+                    scan_dl2, scan_dl3 = st.columns(2)
                     with scan_dl2:
                         if scan_tally_erp9_bytes:
                             st.download_button(
-                                label     = "⬇️ Tally ERP 9 (.xml)",
+                                label     = "⬇️ ERP 9 — Vouchers (.xml)",
                                 data      = scan_tally_erp9_bytes.encode() if isinstance(scan_tally_erp9_bytes, str) else scan_tally_erp9_bytes,
-                                file_name = f"Tally_ERP9_{scan_ts}.xml",
+                                file_name = f"Tally_ERP9_Import_{scan_ts}.xml",
                                 mime      = "application/xml",
                                 use_container_width = True,
                             )
                     with scan_dl3:
                         if scan_tally_prime_bytes:
                             st.download_button(
-                                label     = "⬇️ TallyPrime (.xml)",
+                                label     = "⬇️ TallyPrime — Vouchers (.xml)",
                                 data      = scan_tally_prime_bytes.encode() if isinstance(scan_tally_prime_bytes, str) else scan_tally_prime_bytes,
-                                file_name = f"Tally_Prime_{scan_ts}.xml",
+                                file_name = f"Tally_Prime_Import_{scan_ts}.xml",
                                 mime      = "application/xml",
                                 use_container_width = True,
                             )
@@ -1110,38 +1134,62 @@ if st.session_state["batch_submitted"] and st.session_state["batch_ids"]:
                 excel_bytes       = create_excel(items, dup_warnings or None)
                 tally_erp9_bytes  = status.get("tally_erp9_bytes")
                 tally_prime_bytes = status.get("tally_prime_bytes")
+                tally_erp9_masters_bytes  = status.get("tally_erp9_masters_bytes")
+                tally_prime_masters_bytes = status.get("tally_prime_masters_bytes")
                 ts                = datetime.now().strftime("%Y%m%d_%H%M%S")
 
                 st.subheader("📥 Download Files")
-                dl1, dl2, dl3 = st.columns(3)
-                with dl1:
-                    st.download_button(
-                        label     = "⬇️ Invoice Register (.xlsx)",
-                        data      = excel_bytes,
-                        file_name = f"Invoice_Register_{len(items)}_items.xlsx",
-                        mime      = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width = True,
-                    )
+                st.download_button(
+                    label     = "⬇️ Invoice Register (.xlsx)",
+                    data      = excel_bytes,
+                    file_name = f"Invoice_Register_{len(items)}_items.xlsx",
+                    mime      = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width = True,
+                )
+
+                st.caption("Tally import — **Step 1: Ledger Masters** (creates any missing ledgers)")
+                dlm1, dlm2 = st.columns(2)
+                with dlm1:
+                    if tally_erp9_masters_bytes:
+                        st.download_button(
+                            label     = "⬇️ ERP 9 — Ledger Masters (.xml)",
+                            data      = tally_erp9_masters_bytes.encode() if isinstance(tally_erp9_masters_bytes, str) else tally_erp9_masters_bytes,
+                            file_name = f"Tally_ERP9_LedgerMasters_{ts}.xml",
+                            mime      = "application/xml",
+                            use_container_width = True,
+                        )
+                with dlm2:
+                    if tally_prime_masters_bytes:
+                        st.download_button(
+                            label     = "⬇️ TallyPrime — Ledger Masters (.xml)",
+                            data      = tally_prime_masters_bytes.encode() if isinstance(tally_prime_masters_bytes, str) else tally_prime_masters_bytes,
+                            file_name = f"Tally_Prime_LedgerMasters_{ts}.xml",
+                            mime      = "application/xml",
+                            use_container_width = True,
+                        )
+
+                st.caption("Tally import — **Step 2: Vouchers** (the actual entries)")
+                dl2, dl3 = st.columns(2)
                 with dl2:
                     if tally_erp9_bytes:
                         st.download_button(
-                            label     = "⬇️ Tally ERP 9 (.xml)",
+                            label     = "⬇️ ERP 9 — Vouchers (.xml)",
                             data      = tally_erp9_bytes.encode() if isinstance(tally_erp9_bytes, str) else tally_erp9_bytes,
-                            file_name = f"Tally_ERP9_{ts}.xml",
+                            file_name = f"Tally_ERP9_Import_{ts}.xml",
                             mime      = "application/xml",
                             use_container_width = True,
                         )
                 with dl3:
                     if tally_prime_bytes:
                         st.download_button(
-                            label     = "⬇️ TallyPrime (.xml)",
+                            label     = "⬇️ TallyPrime — Vouchers (.xml)",
                             data      = tally_prime_bytes.encode() if isinstance(tally_prime_bytes, str) else tally_prime_bytes,
-                            file_name = f"Tally_Prime_{ts}.xml",
+                            file_name = f"Tally_Prime_Import_{ts}.xml",
                             mime      = "application/xml",
                             use_container_width = True,
                         )
                 st.caption(
-                    f"Tally XML uses default ledger: **{config.TALLY_DEFAULT_LEDGER}** "
+                    f"Tally vouchers use default expense ledger: **{config.TALLY_DEFAULT_LEDGER}** "
                     f"— reassign ledgers inside Tally after import."
                 )
 

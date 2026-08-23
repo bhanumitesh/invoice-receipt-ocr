@@ -49,6 +49,7 @@ from utils import (
     build_file_content_chunks,
     calculate_cost,
     create_excel,
+    create_tally_ledger_masters_xml,
     create_tally_xml,
     deduplicate_items,
     parse_json_response,
@@ -782,8 +783,11 @@ def retrieve_results(
         if breakdown_parts:
             write_log(job_id, f"Cost by route ({config.MODEL}) | " + " | ".join(breakdown_parts))
 
-        # Create Excel + Tally XMLs
+        # Create Excel + Tally XMLs — ledger masters must be imported before
+        # the vouchers that reference them (see create_tally_ledger_masters_xml).
         excel_bytes      = create_excel(all_items, dup_warnings or None)
+        tally_erp9_masters_bytes  = create_tally_ledger_masters_xml(all_items, "erp9")
+        tally_prime_masters_bytes = create_tally_ledger_masters_xml(all_items, "prime")
         tally_erp9_bytes = create_tally_xml(all_items, "erp9")
         tally_prime_bytes = create_tally_xml(all_items, "prime")
         write_log(job_id, "Excel and Tally XML files created")
@@ -801,6 +805,8 @@ def retrieve_results(
             batch_id          = ", ".join(batch_ids),
             tally_erp9_bytes  = tally_erp9_bytes,
             tally_prime_bytes = tally_prime_bytes,
+            tally_erp9_masters_bytes  = tally_erp9_masters_bytes,
+            tally_prime_masters_bytes = tally_prime_masters_bytes,
         )
         write_log(
             job_id,
@@ -819,6 +825,8 @@ def retrieve_results(
             "error":              "\n".join(errors) if errors else None,
             "tally_erp9_bytes":   tally_erp9_bytes,
             "tally_prime_bytes":  tally_prime_bytes,
+            "tally_erp9_masters_bytes":  tally_erp9_masters_bytes,
+            "tally_prime_masters_bytes": tally_prime_masters_bytes,
             "total_pages":        total_pages or file_count,
         }
 
