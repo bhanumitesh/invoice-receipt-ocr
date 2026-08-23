@@ -44,6 +44,7 @@ import anthropic
 import config
 from db import finalize_credit_reservation, refund_credit_reservation
 from utils import (
+    build_captured_pages_content,
     build_file_content_chunks,
     calculate_cost,
     create_excel,
@@ -151,17 +152,65 @@ def cleanup_submit_status(job_id: str):
         pass
 
 
+# ── "Ended" status file helpers ─────────────────────────────────────────────────
+#
+#  Separate from the full status file above: this signals only "Anthropic has
+#  finished processing these batch_ids" — no items, no Tally XML, nothing
+#  large — so a scan session with many batches can wait for all of them to
+#  reach this point without holding each one's actual results in memory.
+#  Only the session-level finalize step (see finalize_scan_session) retrieves
+#  and combines the real results, once, for the whole session at once.
+
+def _ended_status_path(job_id: str) -> Path: return LOG_DIR / f"ended_{job_id}.status"
+
+
+def write_ended_status(job_id: str, result: dict):
+    with open(_ended_status_path(job_id), "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2, default=str)
+
+
+def read_ended_status(job_id: str) -> dict:
+    path = _ended_status_path(job_id)
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def cleanup_ended_status(job_id: str):
+    path = _ended_status_path(job_id)
+    try:
+        if path.exists():
+            path.unlink()
+    except Exception:
+        pass
+
+
 # ── Submit ────────────────────────────────────────────────────────────────────
 
-def submit_batch(uploaded_files: list, user_email: str = None, job_id: str = None) -> dict:
+def submit_batch(sources: list, user_email: str = None, job_id: str = None) -> dict:
     """
-    Submits each file's content as one or more separate Batch API jobs — one
-    job per chunk (see build_file_content_chunks / MAX_FALLBACK_PAGES_PER_REQUEST),
-    rather than bundling everything into a single job with multiple requests.
-    Each chunk's client.beta.messages.batches.create() call is a genuine
-    network I/O wait, giving real breathing room between bursts of local
-    CPU-bound work (page rendering, image encoding) on CPU-constrained
-    hosts — more reliable than an in-process sleep between chunks.
+    Submits each source's content as one or more separate Batch API jobs —
+    one job per chunk (see build_file_content_chunks / build_captured_pages_content
+    and MAX_FALLBACK_PAGES_PER_REQUEST), rather than bundling everything into
+    a single job with multiple requests. Each chunk's
+    client.beta.messages.batches.create() call is a genuine network I/O
+    wait, giving real breathing room between bursts of local CPU-bound work
+    (page rendering, image encoding) on CPU-constrained hosts — more
+    reliable than an in-process sleep between chunks.
+
+    sources: list where each item is either:
+      - a Streamlit UploadedFile (an uploaded PDF) — built via
+        build_file_content_chunks(), or
+      - a dict {"images": [bytes, ...], "name": "..."} (pages captured via
+        st.camera_input(), not yet assembled into a PDF) — built via
+        build_captured_pages_content().
+    Submission logic below doesn't care which — it only consumes the
+    common {"chunks", "page_count", "fallback_pages", "notes"} shape both
+    builders return.
 
     job_id: if given, logs progress as submission happens (each chunk as
     it's built and submitted), not only after the fact.
@@ -183,11 +232,17 @@ def submit_batch(uploaded_files: list, user_email: str = None, job_id: str = Non
         total_pages      = 0
         req_idx          = 0
 
-        for f in uploaded_files:
-            built = build_file_content_chunks(f, log_fn=log)
+        for source in sources:
+            if isinstance(source, dict) and "images" in source:
+                name  = source.get("name") or "Scanned pages"
+                built = build_captured_pages_content(source["images"], name=name, log_fn=log)
+            else:
+                name  = source.name
+                built = build_file_content_chunks(source, log_fn=log)
+
             total_pages += built["page_count"]
             if built["fallback_pages"] > 0:
-                fallback_files.append(f.name)
+                fallback_files.append(name)
             if built["notes"]:
                 extraction_notes.extend(built["notes"])
 
@@ -229,9 +284,9 @@ def submit_batch(uploaded_files: list, user_email: str = None, job_id: str = Non
 
                 batch = client.beta.messages.batches.create(**create_kwargs)
                 batch_ids.append(batch.id)
-                log(f"{f.name} chunk {chunk_idx + 1}/{n_chunks} → submitted as {batch.id}")
+                log(f"{name} chunk {chunk_idx + 1}/{n_chunks} → submitted as {batch.id}")
 
-        log(f"All chunks submitted | files: {len(uploaded_files)} | batch jobs: {len(batch_ids)}")
+        log(f"All chunks submitted | sources: {len(sources)} | batch jobs: {len(batch_ids)}")
         if fallback_files:
             log(f"Image fallback used for at least one page in: {', '.join(fallback_files)}")
         if extraction_notes:
@@ -262,23 +317,26 @@ def submit_batch(uploaded_files: list, user_email: str = None, job_id: str = Non
         }
 
 
-def _submit_batch_worker(job_id: str, uploaded_files: list, user_email: str = None):
+def _submit_batch_worker(job_id: str, sources: list, user_email: str = None):
     """Background thread target — runs submit_batch() and writes the result
     to a submit_<job_id>.status file for app.py to poll."""
-    result = submit_batch(uploaded_files, user_email=user_email, job_id=job_id)
+    result = submit_batch(sources, user_email=user_email, job_id=job_id)
     write_submit_status(job_id, result)
 
 
-def start_submission_thread(job_id: str, uploaded_files: list, user_email: str = None) -> threading.Thread:
+def start_submission_thread(job_id: str, sources: list, user_email: str = None) -> threading.Thread:
     """
     Runs submit_batch() in a background thread instead of the main script.
     See the module docstring for why this matters — submission does the same
     kind of CPU-bound local work (page rendering, image encoding) that
     poll_until_done() already avoids running synchronously.
+
+    sources: see submit_batch() — uploaded PDF files, or captured-page dicts
+    ({"images": [...], "name": "..."}), or a mix of both.
     """
     t = threading.Thread(
         target=_submit_batch_worker,
-        args=(job_id, uploaded_files, user_email),
+        args=(job_id, sources, user_email),
         daemon=True,
     )
     t.start()
@@ -379,6 +437,130 @@ def start_polling_thread(
     t = threading.Thread(
         target=poll_until_done,
         args=(job_id, batch_ids, file_count, user_email, total_pages, credit_job_id, upload_dup_warnings),
+        daemon=True,
+    )
+    t.start()
+    return t
+
+
+# ── Lightweight "wait for Anthropic to finish" (no retrieval) ──────────────────
+#
+#  Used by the scan-capture flow: a scan session can hold several batches
+#  before the user is done scanning, and emailing per-batch would mean many
+#  emails for one sitting. Each batch just needs to know when Anthropic has
+#  finished with it — not its actual results — so multiple batches can wait
+#  in parallel without holding any real data. The session-level finalize step
+#  (finalize_scan_session) does the one actual retrieval, combining every
+#  batch in the session into a single Excel/email, once all of them reach
+#  this point.
+
+def poll_batches_until_ended(job_id: str, batch_ids: list):
+    """
+    Background daemon thread. Polls batch_ids until every one has ended,
+    then writes a minimal ended_<job_id>.status (no items/cost/attachments —
+    just enough for the caller to know retrieval can happen). Does not call
+    retrieve_results and does not touch credits — the session-level
+    finalize step owns both of those once the whole session is ready.
+    """
+    client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
+    write_log(job_id, f"Waiting for {len(batch_ids)} batch job(s) to finish | interval: {config.POLL_INTERVAL_SECONDS}s")
+
+    pending = set(batch_ids)
+    while pending:
+        for bid in list(pending):
+            try:
+                batch = client.messages.batches.retrieve(bid)
+                if batch.processing_status == "ended":
+                    pending.discard(bid)
+                    write_log(job_id, f"{bid}: ended")
+            except Exception:
+                write_log(job_id, f"Poll error for {bid}:\n{traceback.format_exc()}")
+
+        if pending:
+            time.sleep(config.POLL_INTERVAL_SECONDS)
+
+    write_ended_status(job_id, {"success": True, "batch_ids": batch_ids})
+
+
+def start_ended_wait_thread(job_id: str, batch_ids: list) -> threading.Thread:
+    t = threading.Thread(
+        target=poll_batches_until_ended,
+        args=(job_id, batch_ids),
+        daemon=True,
+    )
+    t.start()
+    return t
+
+
+# ── Scan session finalize (one retrieval + one email for the whole session) ────
+
+def finalize_scan_session(
+    session_job_id: str,
+    batch_ids: list,
+    credit_job_ids: list,
+    batch_count: int,
+    user_email: str = None,
+    total_pages: int = None,
+):
+    """
+    Background daemon thread. Runs once, when every batch in a scan session
+    has reached "ended". Retrieves and merges results across every batch_id
+    from every batch in the session in a single retrieve_results() call —
+    the exact same merge logic already used across a single batch's chunks,
+    just applied one level up — producing one Excel/Tally XML/email for the
+    whole session instead of one per batch.
+
+    credit_job_ids: every scan batch's credit_job_id in this session. All get
+    finalized together on success, or all refunded together on failure —
+    they were reserved independently but the session is retrieved as a unit.
+    """
+    client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
+    write_log(session_job_id, f"Finalizing scan session | batches: {batch_count} | batch jobs: {len(batch_ids)}")
+
+    result = retrieve_results(
+        session_job_id,
+        batch_ids,
+        batch_count,
+        client,
+        user_email=user_email,
+        total_pages=total_pages,
+        upload_dup_warnings=None,
+    )
+
+    for credit_job_id in credit_job_ids:
+        if result["success"]:
+            finalize_credit_reservation(credit_job_id)
+        else:
+            refund_credit_reservation(
+                credit_job_id,
+                reason=result.get("error") or "Scan session processing failed",
+            )
+    result["credit_job_ids"] = credit_job_ids
+
+    write_status(session_job_id, result)
+
+    if result["success"]:
+        write_log(
+            session_job_id,
+            f"Session complete | {len(result.get('items', []))} items | "
+            f"Cost: ${result['cost']['total_cost_usd']:.4f} | "
+            f"Email: {'sent' if result.get('email_sent') else 'FAILED'}"
+        )
+    else:
+        write_log(session_job_id, f"Session FAILED: {result.get('error')}")
+
+
+def start_session_finalize_thread(
+    session_job_id: str,
+    batch_ids: list,
+    credit_job_ids: list,
+    batch_count: int,
+    user_email: str = None,
+    total_pages: int = None,
+) -> threading.Thread:
+    t = threading.Thread(
+        target=finalize_scan_session,
+        args=(session_job_id, batch_ids, credit_job_ids, batch_count, user_email, total_pages),
         daemon=True,
     )
     t.start()
