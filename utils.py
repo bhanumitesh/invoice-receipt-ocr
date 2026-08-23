@@ -18,7 +18,7 @@ import pdfplumber
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
-from PIL import ImageChops
+from PIL import Image, ImageChops
 
 try:
     import pytesseract
@@ -612,6 +612,150 @@ def build_file_content_chunks(f, log_fn=None) -> dict:
         "page_count":     page_count,
         "fallback_pages": extraction.get("scanned_pages", 0),
         "ocr_pages":      extraction.get("ocr_pages", 0),
+        "notes":          notes,
+    }
+
+
+def build_captured_pages_content(images: list, name: str = "Scanned pages", log_fn=None) -> dict:
+    """
+    Like build_file_content_chunks(), but for a list of raw captured page
+    images (bytes, e.g. from st.camera_input()) instead of a PDF file. A
+    camera capture has no text layer to look for, so this skips
+    pdfplumber/text-extraction entirely and goes straight to the same
+    per-page handwriting-check -> OCR-or-image-fallback -> JPEG-encode
+    pipeline already built for scanned PDF pages, then groups fallback pages
+    into the same MAX_FALLBACK_PAGES_PER_REQUEST-sized chunks.
+
+    images: list of raw image bytes, one per captured page, in capture order.
+    name: label used in content headers / logs (e.g. "Scan batch 14:32").
+    log_fn: optional callable(str) for per-line logging (batch mode).
+
+    Returns the same shape as build_file_content_chunks():
+        {
+            "chunks":         list[list[content_block]]
+            "page_count":     int
+            "fallback_pages": int   — pages sent as images
+            "ocr_pages":      int   — pages recovered via local OCR
+            "notes":          list[str]
+        }
+    """
+    def log(msg):
+        if log_fn:
+            log_fn(msg)
+
+    seen_hashes     = set()
+    pages_text      = []
+    fallback_images = []
+    scanned_pages   = 0
+    ocr_pages       = 0
+    skipped_pages   = 0
+    page_count      = len(images)
+
+    for page_num, img_bytes in enumerate(images, 1):
+        try:
+            pil_image = Image.open(io.BytesIO(img_bytes))
+            pil_image.load()
+        except Exception:
+            # Not a decodable image (corrupt capture) — nothing usable to
+            # send either as text or as an image, so skip it rather than
+            # forwarding unreadable bytes mislabeled as a JPEG.
+            skipped_pages += 1
+            log(f"{name} page {page_num} → skipped (unreadable capture)")
+            continue
+
+        if _ocr_available() and not _page_has_annotation(pil_image):
+            ocr_text = _ocr_page_text(pil_image)
+            time.sleep(config.CPU_YIELD_SECONDS)
+            if len(ocr_text) >= config.MIN_PAGE_TEXT_CHARS:
+                page_hash = hashlib.md5(ocr_text.encode("utf-8")).hexdigest()
+                if page_hash not in seen_hashes:
+                    seen_hashes.add(page_hash)
+                    pages_text.append(ocr_text)
+                    ocr_pages += 1
+                else:
+                    skipped_pages += 1
+                continue
+
+        scanned_pages += 1
+        fallback_images.append((page_num, _encode_page_jpeg(pil_image)))
+        time.sleep(config.CPU_YIELD_SECONDS)
+
+    full_text = "\n\n--- PAGE BREAK ---\n\n".join(pages_text)
+
+    header_notes = []
+    if skipped_pages > 0:
+        header_notes.append(f"{skipped_pages} duplicate/unreadable page(s) skipped")
+    if ocr_pages > 0:
+        header_notes.append(f"{ocr_pages} page(s) read via local OCR")
+    if scanned_pages > 0:
+        header_notes.append(f"{scanned_pages} page(s) sent as images below")
+
+    notes = []
+    if header_notes:
+        notes.append(f"{name}: {', '.join(header_notes)}")
+
+    chunk_size   = max(1, config.MAX_FALLBACK_PAGES_PER_REQUEST)
+    image_groups = [
+        fallback_images[i:i + chunk_size]
+        for i in range(0, len(fallback_images), chunk_size)
+    ] or [[]]  # always at least one group, even with zero fallback images
+
+    chunks = []
+
+    for chunk_idx, image_group in enumerate(image_groups):
+        block         = []
+        payload_bytes = 0
+
+        if chunk_idx == 0 and full_text.strip():
+            header = f"=== {name} ==="
+            if header_notes:
+                header += f" [{', '.join(header_notes)}]"
+            block.append({"type": "text", "text": header + "\n\n" + full_text})
+            payload_bytes += len(header) + len(full_text)
+            log(
+                f"{name} → OCR text ({page_count} pages"
+                + (f", {ocr_pages} via local OCR" if ocr_pages else "")
+                + (f", {skipped_pages} pages skipped" if skipped_pages else "")
+                + ")"
+            )
+
+        for page_num, jpeg_bytes in image_group:
+            b64_data = base64.standard_b64encode(jpeg_bytes).decode("utf-8")
+            page_header = f"=== {name} — PAGE {page_num} (image below) ==="
+            block.append({"type": "text", "text": page_header})
+            block.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/jpeg", "data": b64_data},
+            })
+            payload_bytes += len(page_header) + len(b64_data)
+            log(
+                f"{name} page {page_num} → image fallback "
+                f"(chunk {chunk_idx + 1}/{len(image_groups)}, handwriting/stamp detected, "
+                f"or OCR unavailable)"
+            )
+
+        if not block:
+            continue
+
+        payload_mb = payload_bytes / 1024 / 1024
+        if payload_mb > config.MAX_REQUEST_PAYLOAD_MB:
+            raise ValueError(
+                f"{name} (chunk {chunk_idx + 1}/{len(image_groups)}) is too large to "
+                f"process in one request ({payload_mb:.1f}MB, limit is "
+                f"{config.MAX_REQUEST_PAYLOAD_MB:.0f}MB) — try lowering "
+                f"MAX_FALLBACK_PAGES_PER_REQUEST."
+            )
+
+        chunks.append(block)
+
+    if not chunks:
+        log(f"{name} → no usable pages captured")
+
+    return {
+        "chunks":         chunks,
+        "page_count":     page_count,
+        "fallback_pages": scanned_pages,
+        "ocr_pages":      ocr_pages,
         "notes":          notes,
     }
 

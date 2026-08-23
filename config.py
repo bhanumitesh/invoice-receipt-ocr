@@ -200,6 +200,23 @@ CPU_YIELD_SECONDS = float(_optional("CPU_YIELD_SECONDS", "0.05"))
 # sleeps are enough. A 5-page chunk has been confirmed to submit reliably.
 MAX_FALLBACK_PAGES_PER_REQUEST = int(_optional("MAX_FALLBACK_PAGES_PER_REQUEST", "5"))
 
+# ── In-browser scan capture ────────────────────────────────────────────────
+# Pages captured via st.camera_input() auto-submit as a batch once this many
+# accumulate, so the user can keep capturing the next batch immediately
+# instead of waiting. Matches MAX_FALLBACK_PAGES_PER_REQUEST by default so
+# every auto-submitted batch lands at the chunk size already validated as
+# reliable on constrained hosts. A manual "Submit now" is also available for
+# smaller batches (e.g. end of a scanning session).
+SCAN_AUTO_SUBMIT_THRESHOLD = int(_optional("SCAN_AUTO_SUBMIT_THRESHOLD", "5"))
+
+# All batches captured in one scanning sitting ("session") are combined into
+# a single Excel/Tally XML/email once the session ends, rather than emailing
+# separately per batch. A session ends either when the user taps "Done
+# Scanning", or automatically after this many seconds with no new capture or
+# batch — so someone who just closes the tab without clicking anything still
+# gets their results rather than credits sitting reserved indefinitely.
+SCAN_SESSION_IDLE_TIMEOUT_SECONDS = int(_optional("SCAN_SESSION_IDLE_TIMEOUT_SECONDS", "600"))
+
 # ── Extraction prompt ──────────────────────────────────────────────────────
 # Uses abbreviated JSON keys to minimise output tokens.
 # Key map (used in utils.py to expand back to full names for Excel):

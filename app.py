@@ -22,10 +22,14 @@ import config
 from auth import request_otp, validate_otp
 from batch_processor import (
     cleanup_batch_files,
+    cleanup_ended_status,
     cleanup_submit_status,
+    read_ended_status,
     read_status,
     read_submit_status,
+    start_ended_wait_thread,
     start_polling_thread,
+    start_session_finalize_thread,
     start_submission_thread,
 )
 from db import (
@@ -91,7 +95,22 @@ batch_defaults = {
     "processing":                  False,
 }
 
-for k, v in {**auth_defaults, **batch_defaults}.items():
+# Scan-capture flow is entirely independent of the upload flow above — its
+# own session-state, its own job list, so scanning and uploading can be used
+# together without interfering with each other.
+scan_defaults = {
+    "scan_buffer":              [],     # captured page bytes not yet finalized into a batch
+    "scan_capture_count":       0,      # bumped to force a fresh camera_input widget after each capture/finalize
+    "scan_local_build_active":  False,  # serialization gate — only one batch's local build+submit runs at a time
+    "scan_jobs":                [],     # every scan batch created this session, in any state
+    "scan_session_id":          None,   # set on the first batch of a new scanning session
+    "scan_session_credit_ids":  [],     # every batch's credit_job_id in the current session
+    "scan_session_finalizing":  False,  # True once the one combined retrieve+email has been kicked off
+    "scan_finalize_requested":  False,  # set by the "Done Scanning" button
+    "scan_last_activity":       None,   # time.time() of the last capture/batch — drives the idle timeout
+}
+
+for k, v in {**auth_defaults, **batch_defaults, **scan_defaults}.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
@@ -340,7 +359,7 @@ with col_user:
     )
     if st.button("Sign out", use_container_width=True):
         revoke_session(_cookie_session_token())
-        for k, v in {**auth_defaults, **batch_defaults}.items():
+        for k, v in {**auth_defaults, **batch_defaults, **scan_defaults}.items():
             st.session_state[k] = v
         _clear_cookie_session(reload_page=True)
         st.stop()
@@ -484,6 +503,323 @@ elif insufficient_credits:
     st.caption("Add credits or remove PDFs until the required page count fits your balance.")
 elif page_count_error:
     st.caption("Fix the unreadable PDF upload before processing.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SCAN PAGES — capture, auto-chunk, background-submit, session-combined email
+# ══════════════════════════════════════════════════════════════════════════════
+#
+#  Independent of the upload flow above — its own session-state, its own job
+#  list — so scanning and uploading can both be used without interfering.
+#
+#  Resource-aware serialization: capturing a photo is free (just bytes into
+#  memory), so it's never blocked. But only ONE batch's local build+submit
+#  phase (rendering/detecting/encoding pages, then the network call) runs at
+#  a time — that's the CPU-bound part that starved this app's own
+#  health-check handling earlier this session even with per-page cooperative
+#  yields. Once a batch's local build is submitted, it drops into a cheap
+#  wait for Anthropic to finish, which is safe to run in parallel across many
+#  batches — so the gate only serializes the expensive part, not the whole job.
+#
+#  Batches don't retrieve or email their own results — they only wait for
+#  Anthropic to finish ("ended"), so nothing large (items, Tally XML) is held
+#  anywhere while a session is still in progress, however many batches it
+#  has. Once every batch in the session has ended — session closed via the
+#  "Done Scanning" button, or automatically after
+#  SCAN_SESSION_IDLE_TIMEOUT_SECONDS of inactivity — one retrieve_results()
+#  call combines every batch's results into a single Excel/Tally XML/email,
+#  reusing the exact merge logic already used across one batch's own chunks,
+#  just applied one level up.
+
+def _scan_finalize_batch():
+    """Reserves credits and queues the current scan_buffer as a new batch in the session."""
+    images = st.session_state["scan_buffer"]
+    page_count = len(images)
+    credit_job_id = f"scan_{uuid.uuid4().hex}"
+
+    reservation = _apply_credit_reservation(credit_job_id, page_count, mode="scan")
+    if not reservation["success"]:
+        return  # error already shown; leave scan_buffer intact so the user can retry
+
+    if st.session_state["scan_session_id"] is None:
+        st.session_state["scan_session_id"] = f"scansession_{uuid.uuid4().hex}"
+
+    st.session_state["scan_jobs"].append({
+        "credit_job_id": credit_job_id,
+        "page_count":    page_count,
+        "images":        images,
+        "state":         "queued",
+        "batch_ids":     None,
+        "error":         None,
+        "created_at":    datetime.now().strftime("%H:%M:%S"),
+    })
+    st.session_state["scan_session_credit_ids"].append(credit_job_id)
+    st.session_state["scan_buffer"] = []
+    st.session_state["scan_capture_count"] += 1
+    st.session_state["scan_last_activity"] = time.time()
+    st.rerun()
+
+
+def _scan_advance_queue():
+    """Promotes the next queued scan batch to 'submitting' if the gate is free."""
+    if st.session_state["scan_local_build_active"]:
+        return
+    for job in st.session_state["scan_jobs"]:
+        if job["state"] == "queued":
+            job["state"] = "submitting"
+            st.session_state["scan_local_build_active"] = True
+            start_submission_thread(
+                job["credit_job_id"],
+                [{"images": job["images"], "name": f"Scan batch {job['created_at']}"}],
+                user_email=user_email,
+            )
+            job["images"] = None  # the background thread has its own reference now
+            break  # promote at most one per rerun — the gate is exclusive
+
+
+def _scan_poll_jobs():
+    """
+    Advances every in-flight scan job by one step (submitting -> awaiting
+    Anthropic -> ended). Returns True if any batch still needs polling.
+    """
+    for job in st.session_state["scan_jobs"]:
+        if job["state"] == "submitting":
+            submit_status = read_submit_status(job["credit_job_id"])
+            if submit_status is not None:
+                cleanup_submit_status(job["credit_job_id"])
+                st.session_state["scan_local_build_active"] = False
+                if submit_status["success"]:
+                    job["batch_ids"] = submit_status["batch_ids"]
+                    job["state"] = "awaiting_anthropic"
+                    start_ended_wait_thread(job["credit_job_id"], submit_status["batch_ids"])
+                else:
+                    _refund_credit_reservation(
+                        job["credit_job_id"],
+                        reason=submit_status.get("error") or "Scan batch submission failed",
+                    )
+                    job["state"] = "failed"
+                    job["error"] = submit_status.get("error")
+
+        elif job["state"] == "awaiting_anthropic":
+            ended_status = read_ended_status(job["credit_job_id"])
+            if ended_status is not None:
+                cleanup_ended_status(job["credit_job_id"])
+                job["state"] = "ended"
+
+    return any(j["state"] in ("queued", "submitting", "awaiting_anthropic") for j in st.session_state["scan_jobs"])
+
+
+def _scan_request_finalize():
+    st.session_state["scan_finalize_requested"] = True
+
+
+def _scan_reset_session():
+    for k, v in scan_defaults.items():
+        st.session_state[k] = v
+
+
+st.subheader("📷 Scan Pages")
+st.caption(
+    f"Capture pages with your camera — every {config.SCAN_AUTO_SUBMIT_THRESHOLD} pages "
+    f"auto-submits as a batch in the background, so you can keep scanning without waiting. "
+    f"All batches from one sitting are combined into a single email when you're done."
+)
+
+scan_jobs_still_polling = _scan_poll_jobs()
+_scan_advance_queue()
+
+scan_has_batches = bool(st.session_state["scan_jobs"])
+scan_all_ended = scan_has_batches and all(
+    j["state"] in ("ended", "failed") for j in st.session_state["scan_jobs"]
+)
+scan_idle_timed_out = (
+    st.session_state["scan_last_activity"] is not None
+    and not scan_jobs_still_polling
+    and (time.time() - st.session_state["scan_last_activity"]) > config.SCAN_SESSION_IDLE_TIMEOUT_SECONDS
+)
+
+# ── Session finalization trigger ──
+if (
+    st.session_state["scan_session_id"]
+    and not st.session_state["scan_session_finalizing"]
+    and scan_all_ended
+    and (scan_idle_timed_out or st.session_state["scan_finalize_requested"])
+):
+    st.session_state["scan_finalize_requested"] = False
+    ended_batch_ids = [
+        bid for j in st.session_state["scan_jobs"] if j["state"] == "ended"
+        for bid in (j["batch_ids"] or [])
+    ]
+    total_scan_pages = sum(j["page_count"] for j in st.session_state["scan_jobs"] if j["state"] == "ended")
+
+    if ended_batch_ids:
+        st.session_state["scan_session_finalizing"] = True
+        start_session_finalize_thread(
+            st.session_state["scan_session_id"],
+            ended_batch_ids,
+            st.session_state["scan_session_credit_ids"],
+            len(st.session_state["scan_jobs"]),
+            user_email=user_email,
+            total_pages=total_scan_pages,
+        )
+    else:
+        # Every batch failed at submission — nothing succeeded to retrieve.
+        _scan_reset_session()
+    st.rerun()
+
+# ── Capture UI — hidden once the session is finalizing, so a fresh capture
+#    never lands mid-way through an already-closing session ──
+if not st.session_state["scan_session_finalizing"]:
+    scan_capture = st.camera_input(
+        "Take a photo of the next page",
+        key=f"scan_cam_{st.session_state['scan_capture_count']}",
+    )
+    if scan_capture is not None:
+        st.session_state["scan_buffer"].append(scan_capture.getvalue())
+        st.session_state["scan_capture_count"] += 1
+        st.session_state["scan_last_activity"] = time.time()
+        st.rerun()
+
+    if st.session_state["scan_buffer"]:
+        buffered = st.session_state["scan_buffer"]
+        st.write(f"**{len(buffered)} page(s) captured, not yet submitted** "
+                 f"(auto-submits at {config.SCAN_AUTO_SUBMIT_THRESHOLD}):")
+
+        thumb_cols = st.columns(min(len(buffered), 5))
+        for i, img_bytes in enumerate(buffered):
+            with thumb_cols[i % len(thumb_cols)]:
+                st.image(img_bytes, use_container_width=True)
+                if st.button("✕ Remove", key=f"scan_remove_{i}"):
+                    st.session_state["scan_buffer"].pop(i)
+                    st.rerun()
+
+        scan_pages_now = len(st.session_state["scan_buffer"])
+        if user_credits < scan_pages_now:
+            st.error(
+                f"🚫 Not enough credits to process these {scan_pages_now} page(s). "
+                f"Available: {user_credits}."
+            )
+        elif st.button(f"🚀 Process These {scan_pages_now} Page(s) Now", use_container_width=True):
+            _scan_finalize_batch()
+
+        if len(st.session_state["scan_buffer"]) >= config.SCAN_AUTO_SUBMIT_THRESHOLD:
+            _scan_finalize_batch()
+
+# ── Per-batch status cards ──
+if scan_has_batches:
+    st.divider()
+    st.subheader("📦 Scan Batches")
+
+    for job in st.session_state["scan_jobs"]:
+        with st.container(border=True):
+            st.caption(f"Captured {job['created_at']} — {job['page_count']} page(s)")
+
+            if job["state"] == "queued":
+                st.info("⏳ Queued — waiting for the current batch's submission to finish.")
+            elif job["state"] == "submitting":
+                st.info("📤 Submitting in the background...")
+            elif job["state"] == "awaiting_anthropic":
+                st.info("⏳ Processing on Anthropic's side...")
+            elif job["state"] == "ended":
+                st.success("✅ Done — included in the session's combined results once you finish scanning.")
+            elif job["state"] == "failed":
+                st.error(f"❌ Failed: {job.get('error') or 'Unknown error'}")
+
+    if not st.session_state["scan_session_finalizing"]:
+        if scan_all_ended:
+            st.button(
+                "✅ Done Scanning — Send Results",
+                use_container_width=True,
+                type="primary",
+                on_click=_scan_request_finalize,
+            )
+        else:
+            st.caption("Waiting for all batches to finish before results can be sent.")
+
+# ── Session finalize status ──
+if st.session_state["scan_session_finalizing"]:
+    st.divider()
+    st.subheader("📧 Finalizing Scan Session")
+
+    session_status = read_status(st.session_state["scan_session_id"])
+    if session_status is None:
+        st.info("⏳ Combining all batches into one Excel/email...")
+        time.sleep(5)
+        st.rerun()
+    else:
+        cleanup_batch_files(st.session_state["scan_session_id"])
+        if session_status.get("success"):
+            items = session_status.get("items", [])
+            st.success(
+                f"✅ Session complete — {len(items)} line item(s) extracted across "
+                f"{len(st.session_state['scan_jobs'])} batch(es)."
+            )
+            if session_status.get("email_sent"):
+                st.success(f"📧 Emailed to {user_email}")
+            else:
+                st.warning(
+                    f"⚠️ Email could not be sent: {session_status.get('email_error', 'Unknown error')}\n\n"
+                    f"Please download files below."
+                )
+
+            if items:
+                st.subheader("📋 Extracted Data")
+                st.dataframe(items, use_container_width=True, hide_index=True)
+
+                if not session_status.get("email_sent"):
+                    scan_excel_bytes       = create_excel(items, session_status.get("dup_warnings") or None)
+                    scan_tally_erp9_bytes  = session_status.get("tally_erp9_bytes")
+                    scan_tally_prime_bytes = session_status.get("tally_prime_bytes")
+                    scan_ts                = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+                    st.subheader("📥 Download Files")
+                    scan_dl1, scan_dl2, scan_dl3 = st.columns(3)
+                    with scan_dl1:
+                        st.download_button(
+                            label     = "⬇️ Invoice Register (.xlsx)",
+                            data      = scan_excel_bytes,
+                            file_name = f"Invoice_Register_{len(items)}_items.xlsx",
+                            mime      = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width = True,
+                        )
+                    with scan_dl2:
+                        if scan_tally_erp9_bytes:
+                            st.download_button(
+                                label     = "⬇️ Tally ERP 9 (.xml)",
+                                data      = scan_tally_erp9_bytes.encode() if isinstance(scan_tally_erp9_bytes, str) else scan_tally_erp9_bytes,
+                                file_name = f"Tally_ERP9_{scan_ts}.xml",
+                                mime      = "application/xml",
+                                use_container_width = True,
+                            )
+                    with scan_dl3:
+                        if scan_tally_prime_bytes:
+                            st.download_button(
+                                label     = "⬇️ TallyPrime (.xml)",
+                                data      = scan_tally_prime_bytes.encode() if isinstance(scan_tally_prime_bytes, str) else scan_tally_prime_bytes,
+                                file_name = f"Tally_Prime_{scan_ts}.xml",
+                                mime      = "application/xml",
+                                use_container_width = True,
+                            )
+        else:
+            st.error("❌ Session processing failed.")
+            with st.expander("Error details"):
+                st.code(session_status.get("error", "Unknown error"))
+
+        if st.button("🔄 Start New Scan Session", use_container_width=True, type="primary"):
+            _scan_reset_session()
+            st.rerun()
+
+elif scan_jobs_still_polling:
+    time.sleep(3)
+    st.rerun()
+elif scan_has_batches and scan_all_ended and not scan_idle_timed_out:
+    # Nothing left to poll, but the user hasn't clicked "Done Scanning" yet —
+    # keep a slow heartbeat going so the idle timeout can still fire even
+    # with no other reruns pending.
+    time.sleep(30)
+    st.rerun()
+
+st.divider()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
