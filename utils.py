@@ -1254,6 +1254,62 @@ def _escape_xml(val) -> str:
     return s
 
 
+def canonicalize_party_names(items: list) -> list:
+    """
+    Returns a new list of items with party_name normalized so the same
+    real-world vendor always gets exactly one ledger name across a batch —
+    Claude's extraction of a vendor name isn't guaranteed byte-identical
+    across different invoices from the same vendor (e.g. "Sri Venkateswara
+    Filling Station" vs "SRI VENKATESWARA FILLING STATION"), and Tally
+    matches ledger names by exact string. Without this, create_tally_
+    ledger_masters_xml() and create_tally_xml() could disagree on the name
+    for the same vendor, or the masters file could create two ledgers for
+    one real vendor.
+
+    The first-seen variant (whitespace-collapsed) becomes the canonical
+    name for every item that matches on a case/whitespace-insensitive key.
+    Must be applied identically to whatever gets passed to BOTH Tally file
+    generators — this only touches the copy handed to them, not all_items
+    used for the Excel register, which should still reflect exactly what
+    was extracted.
+    """
+    canonical_by_key = {}
+    normalized_items = []
+    for item in items:
+        raw = re.sub(r"\s+", " ", str(item.get("party_name") or "")).strip()
+        key = raw.casefold()
+        if key and key not in canonical_by_key:
+            canonical_by_key[key] = raw
+        new_item = dict(item)
+        if key:
+            new_item["party_name"] = canonical_by_key[key]
+        normalized_items.append(new_item)
+    return normalized_items
+
+
+def tally_excluded_items(items: list) -> list:
+    """
+    Returns invoice_no/party_name/total_value for items excluded from both
+    Tally files because total_value <= 0 (credit notes, corrections, or a
+    zero-value extraction result) — create_tally_xml() and
+    create_tally_ledger_masters_xml() both silently skip these rather than
+    guessing at how to represent them (e.g. a credit note needs its debit/
+    credit sides reversed, which risks compounding an extraction error into
+    a wrong reversing entry), so this lets callers surface them as an
+    explicit warning instead of losing them without a trace.
+    """
+    excluded = []
+    for item in items:
+        total = _parse_amount(item.get("total_value"))
+        if total <= 0:
+            excluded.append({
+                "invoice_no":   item.get("invoice_no", ""),
+                "party_name":   item.get("party_name", ""),
+                "total_value":  total,
+            })
+    return excluded
+
+
 def _build_voucher_xml(item: dict, tally_version: str) -> str:
     """
     Builds a single <VOUCHER> XML block for one invoice line item, as a
@@ -1271,6 +1327,14 @@ def _build_voucher_xml(item: dict, tally_version: str) -> str:
     date      = _tally_date(item.get("invoice_date", ""))
     party     = _escape_xml(item.get("party_name", ""))
     inv_no    = _escape_xml(item.get("invoice_no",  ""))
+    # Unique per vendor+invoice+date, not invoice number alone — invoice
+    # numbers aren't globally unique (two different vendors can both send an
+    # "INV-001"), and REMOTEID/GUID are Tally's own keys for detecting "is
+    # this the same object already imported" — a collision across vendors
+    # would make Tally treat an unrelated invoice as an alteration of this one.
+    voucher_key = hashlib.md5(
+        f"{item.get('party_name','')}|{item.get('invoice_no','')}|{item.get('invoice_date','')}".encode("utf-8")
+    ).hexdigest()
     narration = _escape_xml(
         f"{item.get('description','')} | Invoice: {item.get('invoice_no','')} "
         f"| GSTIN: {item.get('gstin','') or 'N/A'} "
@@ -1350,9 +1414,9 @@ def _build_voucher_xml(item: dict, tally_version: str) -> str:
     prime_attrs = ' RESERVEDNAME=""' if tally_version == "prime" else ""
 
     voucher = f"""
-        <VOUCHER REMOTEID="{inv_no}" VCHTYPE="Journal" ACTION="Create"{prime_attrs}>
+        <VOUCHER REMOTEID="{voucher_key}" VCHTYPE="Journal" ACTION="Create"{prime_attrs}>
         <DATE>{date}</DATE>
-        <GUID>{inv_no}-{date}</GUID>
+        <GUID>{voucher_key}</GUID>
         <VOUCHERTYPENAME>Journal</VOUCHERTYPENAME>
         <VOUCHERNUMBER>{inv_no}</VOUCHERNUMBER>
         <PARTYLEDGERNAME>{party}</PARTYLEDGERNAME>
@@ -1526,6 +1590,7 @@ def send_email(
     tally_prime_bytes: bytes = None,
     tally_erp9_masters_bytes:  bytes = None,
     tally_prime_masters_bytes: bytes = None,
+    tally_excluded:    list  = None,
 ) -> tuple:
     """
     Sends Excel + both Tally XML files as email attachments via Resend API.
@@ -1562,6 +1627,21 @@ def send_email(
             + "\n"
         )
 
+    tally_excluded_section = ""
+    if tally_excluded:
+        tally_excluded_section = (
+            "\n-- Excluded From Tally Files (zero/negative total) --\n"
+            + "\n".join(
+                f"  * {x.get('party_name') or 'Unknown vendor'} / "
+                f"Invoice {x.get('invoice_no') or 'N/A'}: "
+                f"{x.get('total_value'):.2f} — likely a credit note/correction; "
+                f"still in the Excel register, but not auto-posted to Tally — "
+                f"enter manually if valid"
+                for x in tally_excluded
+            )
+            + "\n"
+        )
+
     body = (
         f"Hi,\n\n"
         f"Your invoice extraction is complete.\n\n"
@@ -1574,6 +1654,7 @@ def send_email(
         + (f"Batch ID             : {batch_id}\n" if batch_id else "")
         + upload_dup_section
         + dup_section
+        + tally_excluded_section
         + f"\n-- Note --\n"
         f"Attachments:\n"
         f"  Invoice_Register.xlsx        — full register for review\n"

@@ -48,12 +48,14 @@ from utils import (
     build_captured_pages_content,
     build_file_content_chunks,
     calculate_cost,
+    canonicalize_party_names,
     create_excel,
     create_tally_ledger_masters_xml,
     create_tally_xml,
     deduplicate_items,
     parse_json_response,
     send_email,
+    tally_excluded_items,
 )
 
 # ── Log directory ─────────────────────────────────────────────────────────────
@@ -785,12 +787,25 @@ def retrieve_results(
 
         # Create Excel + Tally XMLs — ledger masters must be imported before
         # the vouchers that reference them (see create_tally_ledger_masters_xml).
-        excel_bytes      = create_excel(all_items, dup_warnings or None)
-        tally_erp9_masters_bytes  = create_tally_ledger_masters_xml(all_items, "erp9")
-        tally_prime_masters_bytes = create_tally_ledger_masters_xml(all_items, "prime")
-        tally_erp9_bytes = create_tally_xml(all_items, "erp9")
-        tally_prime_bytes = create_tally_xml(all_items, "prime")
+        # Tally files use a canonicalized copy of all_items so the same
+        # vendor always gets one ledger name even if Claude's extraction
+        # varied casing/whitespace across invoices — the Excel register
+        # itself still reflects exactly what was extracted, uncanonicalized.
+        excel_bytes = create_excel(all_items, dup_warnings or None)
+        tally_items = canonicalize_party_names(all_items)
+        tally_erp9_masters_bytes  = create_tally_ledger_masters_xml(tally_items, "erp9")
+        tally_prime_masters_bytes = create_tally_ledger_masters_xml(tally_items, "prime")
+        tally_erp9_bytes = create_tally_xml(tally_items, "erp9")
+        tally_prime_bytes = create_tally_xml(tally_items, "prime")
         write_log(job_id, "Excel and Tally XML files created")
+
+        tally_excluded = tally_excluded_items(all_items)
+        for x in tally_excluded:
+            write_log(
+                job_id,
+                f"Excluded from Tally files (total_value <= 0): "
+                f"{x['party_name'] or 'Unknown vendor'} / {x['invoice_no'] or 'N/A'} = {x['total_value']:.2f}"
+            )
 
         email_ok, email_result = send_email(
             excel_bytes       = excel_bytes,
@@ -803,6 +818,7 @@ def retrieve_results(
             upload_dup_warnings = upload_dup_warnings or None,
             realtime_cost     = realtime_cost,
             batch_id          = ", ".join(batch_ids),
+            tally_excluded    = tally_excluded or None,
             tally_erp9_bytes  = tally_erp9_bytes,
             tally_prime_bytes = tally_prime_bytes,
             tally_erp9_masters_bytes  = tally_erp9_masters_bytes,

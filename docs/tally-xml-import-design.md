@@ -147,27 +147,91 @@ since the same vendors will keep recurring across future invoice batches.
 
 ## 6. Open questions
 
-1. **Auto Tyre's missing GST** — need to check the actual source invoice
-   PDF/image to confirm whether it's a Composition Scheme dealer (tax
+1. **Auto Tyre's missing GST** — still unresolved. Need the actual source
+   invoice PDF/image to confirm whether it's a Composition Scheme dealer (tax
    legitimately not shown) or an extraction miss on our end.
-2. **Expense-category-per-vendor** — is this predictable/mappable (e.g. a
-   fixed vendor→ledger table we could maintain), or a genuine case-by-case
-   judgment call that should stay manual? User is checking and will follow up.
-3. **`ISINVOICE` placement/value** — voucher-level `Yes` vs. the current
-   per-ledger-entry `No`? Needs a real Tally-exported example to confirm
-   definitively; public documentation is inconsistent here.
-4. **Bill-wise allocation** — do we want to add `BILLALLOCATIONS.LIST` (New
-   Ref = invoice number) on the party credit line, and if so, what exactly
-   does Tally expect there (bill name, amount, due date, bill type)?
-5. **Ledger `PARENT` group assignment** — for auto-generated party ledgers
-   (unknown vendors), what's the right default group ("Sundry Creditors"),
-   and for expense-category ledgers, is there a sensible default group or
-   does that also need per-invoice-type judgment?
+2. **Expense-category-per-vendor** — still deferred. Confirmed fine to keep
+   the single flat "Purchase Account" expense ledger for now; revisit if/when
+   a predictable vendor→ledger mapping emerges.
+3. ~~`ISINVOICE` placement/value~~ — **resolved.** Real Tally import test
+   (see §7) confirmed voucher-level `ISINVOICE=No` imports cleanly.
+4. ~~Bill-wise allocation~~ — **agreed to build** (see §7); not yet
+   implemented.
+5. **Ledger `PARENT` group assignment** — still using `Sundry Creditors` /
+   `Indirect Expenses` / `Duties & Taxes` as implemented; no real-world
+   problem surfaced with these yet.
 
-The most reliable way to resolve #3 and #4 definitively (per Tally's own
-guidance): record one realistic voucher by hand in TallyPrime exactly as
-wanted — Journal type, GST split, bill-wise reference — then export just that
-one voucher to XML and diff it against what this generator produces.
+## 7. Follow-up: real Tally test + fixes applied (2026-08-24)
+
+**The two-file import was tested against a real Tally company and worked
+cleanly** — ledger masters imported first, then the vouchers file, no
+errors. This resolves open question #3 above and validates the overall
+two-step design.
+
+Three additional issues were identified and fixed in the same pass:
+
+- **Vendor-ledger de-duplication now normalizes names.** `create_tally_
+  ledger_masters_xml()`'s original exact-string-match dedup would have
+  treated e.g. `"Sri Venkateswara Filling Station"` and `"SRI VENKATESWARA
+  FILLING STATION"` as two different vendors — a likely outcome given LLM
+  extraction isn't guaranteed byte-identical across invoices from the same
+  vendor. Fixed with a new `canonicalize_party_names()` in `utils.py`,
+  applied once to a copy of the batch's items before *both* Tally file
+  generators run, so the masters file and the vouchers file always agree on
+  one canonical name per vendor. The Excel register is unaffected — it still
+  reflects exactly what was extracted, uncanonicalized.
+- **`REMOTEID`/`GUID` no longer collide across vendors.** They previously
+  used the invoice number alone, which isn't globally unique (two different
+  vendors can each send an "INV-001") — a collision would make Tally treat
+  an unrelated invoice as an alteration of the first one. Now built from a
+  hash of vendor + invoice number + date, unique per real invoice and stable
+  across re-imports of the *same* invoice (the same invoice always
+  reproduces the same key — confirmed by test).
+- **Zero/negative-total items (credit notes, corrections) no longer vanish
+  silently.** Both Tally generators still exclude anything with
+  `total_value <= 0` — auto-generating a correct reversing entry was judged
+  too risky without more confidence in how reliably the extraction
+  identifies genuine credit notes vs. an extraction error — but a new
+  `tally_excluded_items()` now surfaces exactly what was excluded (vendor,
+  invoice number, amount) as an explicit warning section in the results
+  email, so nothing is lost without a trace. Checked the two real
+  `Invoice_Register_*.xlsx` files already on hand from past runs: zero rows
+  with `total_value <= 0` in either (small sample, so this hasn't been a
+  problem in practice yet, not proof it won't come up).
+
+**Deferred, not fixed:** cross-batch re-import protection (the same invoice
+processed again in a later batch, weeks apart). Current reasoning: since
+`REMOTEID` is now stable per real invoice, and the underlying extracted data
+for the same source document should be the same each time, Tally's
+create-or-alter behavior on a repeat `REMOTEID` should just re-write the same
+values — no double-booking. The residual risk is narrower than originally
+framed: not "will it double-count," but "could a second import *silently
+overwrite* a correct voucher with slightly different numbers" if extraction
+drifts between the two runs (a prompt/model change between processing dates,
+or ordinary LLM non-determinism on a borderline field). Low-probability,
+acceptable to leave for a later pass — would need the app to remember which
+invoices it's already sent to Tally, across sessions, to close fully.
+
+**Bill-wise allocation clarified with a concrete example and agreed to build
+as a follow-up** (not yet implemented). Worth restating why it matters: today,
+three invoices from the same vendor each post as their own *voucher*
+(transaction), correctly, against the *same* single vendor *ledger* (account)
+— that's normal double-entry, not a bug, and multiple vouchers referencing one
+shared ledger is exactly right. But without bill-wise allocation, that shared
+ledger's outstanding balance shows as one lump number with no way, from inside
+Tally, to tell which portion belongs to which invoice — so when it's time to
+pay one specific bill, the accountant still has to reconcile against the
+Excel/email outside of Tally. Adding `BILLALLOCATIONS.LIST` (`BILLTYPE="New
+Ref"`, `NAME`=invoice number, matching `AMOUNT`) on the party's credit line
+gives each invoice its own trackable "bill" inside Tally, letting a later
+payment be recorded against a specific one (`BILLTYPE="Agst Ref"`) — this is
+the piece that actually removes the "which invoice was this for" manual
+reconciliation step.
+
+The most reliable way to resolve open question #5 (`PARENT` group choices)
+definitively, if it ever needs it (per Tally's own guidance): record one
+realistic voucher by hand in TallyPrime exactly as wanted, then export just
+that one voucher to XML and diff it against what this generator produces.
 
 ## Sources consulted
 

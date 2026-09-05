@@ -151,7 +151,10 @@ Every run produces five files:
 - Entries are created as **Journal vouchers** (`VCHTYPE="Journal"`), matching how these are actually recorded in practice — not the invoice-style Purchase voucher used in earlier versions of this tool. See [docs/tally-xml-import-design.md](docs/tally-xml-import-design.md) for the full reasoning.
 - All line items post to the single default expense ledger set in `TALLY_DEFAULT_LEDGER`, for every vendor — real-world usage often varies the expense ledger per vendor (e.g. "Repair and Maintenance" vs. "Diesel and Petrol"), which this doesn't do yet; reassign inside Tally after import as needed
 - GST amounts (CGST, SGST/UTGST, IGST) are posted as separate debit lines automatically, only when present on the invoice — see `docs/tally-xml-import-design.md` for why some vendors (e.g. GST-exempt fuel purchases, or Composition Scheme dealers) legitimately have none
-- Party (vendor) is set as the creditor ledger, credited for the invoice total — no bill-wise/outstanding-per-invoice tracking yet (see the design doc's open questions)
+- Party (vendor) is set as the creditor ledger, credited for the invoice total — no bill-wise/outstanding-per-invoice tracking yet (planned; see the design doc)
+- Vendor names are normalized (case/whitespace-insensitive) before generating Tally files, so the same real-world vendor always gets exactly one ledger even if extraction varied its casing across invoices — verified against a real Tally import
+- Each voucher's `REMOTEID`/`GUID` is a hash of vendor + invoice number + date, not the invoice number alone, so two different vendors happening to share an invoice number can't collide
+- Line items with a zero or negative total (credit notes, corrections) are excluded from both Tally files rather than guessed at — they're listed in the results email instead, and still appear in the Excel register
 - Both ERP 9 and TallyPrime versions of each file are always generated — use whichever applies to your version
 
 ### Duplicate invoice handling
