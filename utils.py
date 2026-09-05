@@ -1335,6 +1335,11 @@ def _build_voucher_xml(item: dict, tally_version: str) -> str:
     voucher_key = hashlib.md5(
         f"{item.get('party_name','')}|{item.get('invoice_no','')}|{item.get('invoice_date','')}".encode("utf-8")
     ).hexdigest()
+    # Bill-wise reference name — must be unique per party (Tally scopes bill
+    # names to the ledger they're on, not globally), so falls back to a
+    # voucher_key-derived value when the invoice number wasn't extracted,
+    # rather than risking two bills on the same vendor both named "".
+    bill_name = inv_no if item.get("invoice_no") else f"{date}-{voucher_key[:8]}"
     narration = _escape_xml(
         f"{item.get('description','')} | Invoice: {item.get('invoice_no','')} "
         f"| GSTIN: {item.get('gstin','') or 'N/A'} "
@@ -1398,12 +1403,23 @@ def _build_voucher_xml(item: dict, tally_version: str) -> str:
             <CATEGORYENTRIES.LIST/>
         </ALLLEDGERENTRIES.LIST>""")
 
-    # Credit — party (sundry creditor)
+    # Credit — party (sundry creditor), with bill-wise allocation so Tally
+    # tracks this invoice as its own trackable bill under the vendor's
+    # ledger, rather than folding it into one lump running balance — see
+    # docs/tally-xml-import-design.md for why this matters for AP tracking.
+    # BILLTYPE is always "New Ref": this app only records purchases, never
+    # payments, so every bill it creates is a fresh one, not a settlement
+    # against an existing bill ("Agst Ref").
     entries.append(f"""
         <ALLLEDGERENTRIES.LIST>
             <LEDGERNAME>{party}</LEDGERNAME>
             <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
             <AMOUNT>{total:.2f}</AMOUNT>
+            <BILLALLOCATIONS.LIST>
+                <NAME>{bill_name}</NAME>
+                <BILLTYPE>New Ref</BILLTYPE>
+                <AMOUNT>{total:.2f}</AMOUNT>
+            </BILLALLOCATIONS.LIST>
             <GODOWNENTRIES.LIST/>
             <CATEGORYENTRIES.LIST/>
         </ALLLEDGERENTRIES.LIST>""")

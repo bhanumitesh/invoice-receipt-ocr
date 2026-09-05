@@ -155,8 +155,7 @@ since the same vendors will keep recurring across future invoice batches.
    a predictable vendor→ledger mapping emerges.
 3. ~~`ISINVOICE` placement/value~~ — **resolved.** Real Tally import test
    (see §7) confirmed voucher-level `ISINVOICE=No` imports cleanly.
-4. ~~Bill-wise allocation~~ — **agreed to build** (see §7); not yet
-   implemented.
+4. ~~Bill-wise allocation~~ — **implemented** (see §8).
 5. **Ledger `PARENT` group assignment** — still using `Sundry Creditors` /
    `Indirect Expenses` / `Duties & Taxes` as implemented; no real-world
    problem surfaced with these yet.
@@ -232,6 +231,53 @@ The most reliable way to resolve open question #5 (`PARENT` group choices)
 definitively, if it ever needs it (per Tally's own guidance): record one
 realistic voucher by hand in TallyPrime exactly as wanted, then export just
 that one voucher to XML and diff it against what this generator produces.
+
+## 8. Bill-wise allocation — implemented (2026-09-06)
+
+`_build_voucher_xml()`'s party credit line now carries a
+`<BILLALLOCATIONS.LIST>`:
+
+```xml
+<ALLLEDGERENTRIES.LIST>
+    <LEDGERNAME>Acme Traders</LEDGERNAME>
+    <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+    <AMOUNT>5250.00</AMOUNT>
+    <BILLALLOCATIONS.LIST>
+        <NAME>INV-001</NAME>
+        <BILLTYPE>New Ref</BILLTYPE>
+        <AMOUNT>5250.00</AMOUNT>
+    </BILLALLOCATIONS.LIST>
+    <GODOWNENTRIES.LIST/>
+    <CATEGORYENTRIES.LIST/>
+</ALLLEDGERENTRIES.LIST>
+```
+
+`BILLTYPE` is always `"New Ref"` — this app only records purchases, never
+payments, so every bill it creates is a fresh one, not a settlement against
+an existing bill (`"Agst Ref"`, which would come from a separate payment-
+voucher feature this app doesn't have).
+
+**Bill name uniqueness**: per Tally's documented behavior, a bill name only
+needs to be unique *within one party's ledger*, not globally — so using the
+invoice number directly is safe even across different vendors sharing an
+invoice number. When the invoice number wasn't extracted at all, falls back
+to a `{date}-{voucher_key prefix}` reference rather than risking two bills
+on the same vendor both named `""`.
+
+Verified with a direct test: two different invoices from the same vendor
+produce two distinct bill names (no collision), and the missing-invoice-
+number fallback produces a valid, unique reference.
+
+**Updates the cross-batch re-import risk noted in §7.** Previously the
+concern was a silent overwrite if the same invoice's extracted data drifted
+between two import runs. With bill-wise allocation now creating a `"New
+Ref"` bill each time, Tally's own duplicate-bill-name handling becomes the
+relevant behavior instead — per Tally's documentation, a bill name is meant
+to be unique per party, so a second `"New Ref"` for a name that already
+exists may surface as an explicit error rather than a silent overwrite,
+which would actually be a better outcome (forces the accountant to notice)
+than the risk originally described. This hasn't been verified against a real
+re-import yet — worth confirming next time a duplicate scenario comes up.
 
 ## Sources consulted
 
