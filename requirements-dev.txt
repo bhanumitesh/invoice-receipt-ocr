@@ -1,0 +1,5 @@
+# Only needed to run the test suite (tests/) — not required by the app
+# itself, so kept separate from requirements.txt rather than adding a
+# testing-only dependency to what Render installs in production.
+-r requirements.txt
+pytest>=8.0.0

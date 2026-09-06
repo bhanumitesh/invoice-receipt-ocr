@@ -787,25 +787,50 @@ def retrieve_results(
 
         # Create Excel + Tally XMLs — ledger masters must be imported before
         # the vouchers that reference them (see create_tally_ledger_masters_xml).
-        # Tally files use a canonicalized copy of all_items so the same
-        # vendor always gets one ledger name even if Claude's extraction
-        # varied casing/whitespace across invoices — the Excel register
-        # itself still reflects exactly what was extracted, uncanonicalized.
         excel_bytes = create_excel(all_items, dup_warnings or None)
-        tally_items = canonicalize_party_names(all_items)
-        tally_erp9_masters_bytes  = create_tally_ledger_masters_xml(tally_items, "erp9")
-        tally_prime_masters_bytes = create_tally_ledger_masters_xml(tally_items, "prime")
-        tally_erp9_bytes = create_tally_xml(tally_items, "erp9")
-        tally_prime_bytes = create_tally_xml(tally_items, "prime")
-        write_log(job_id, "Excel and Tally XML files created")
+        write_log(job_id, "Excel file created")
 
-        tally_excluded = tally_excluded_items(all_items)
-        for x in tally_excluded:
+        # Tally file generation is isolated in its own try/except — this
+        # logic is newer and less battle-tested than Excel creation
+        # (canonicalization, bill-wise hashing, XML escaping edge cases), so
+        # a bug here shouldn't be able to block the Excel/email — the
+        # older, more reliable deliverable — from going out at all. On
+        # failure, an Excel-only email still goes out with an explicit note
+        # rather than silently omitting the Tally files.
+        tally_erp9_bytes = tally_prime_bytes = None
+        tally_erp9_masters_bytes = tally_prime_masters_bytes = None
+        tally_excluded = []
+        tally_generation_error = None
+        try:
+            # Tally files use a canonicalized copy of all_items so the same
+            # vendor always gets one ledger name even if Claude's extraction
+            # varied casing/whitespace across invoices — the Excel register
+            # itself still reflects exactly what was extracted, uncanonicalized.
+            tally_items = canonicalize_party_names(all_items)
+            tally_erp9_masters_bytes  = create_tally_ledger_masters_xml(tally_items, "erp9")
+            tally_prime_masters_bytes = create_tally_ledger_masters_xml(tally_items, "prime")
+            tally_erp9_bytes = create_tally_xml(tally_items, "erp9")
+            tally_prime_bytes = create_tally_xml(tally_items, "prime")
+
+            tally_excluded = tally_excluded_items(all_items)
+            for x in tally_excluded:
+                write_log(
+                    job_id,
+                    f"Excluded from Tally files (total_value <= 0): "
+                    f"{x['party_name'] or 'Unknown vendor'} / {x['invoice_no'] or 'N/A'} = {x['total_value']:.2f}"
+                )
+            write_log(job_id, "Tally XML files created")
+        except Exception:
+            tally_generation_error = traceback.format_exc()
+            tally_erp9_bytes = tally_prime_bytes = None
+            tally_erp9_masters_bytes = tally_prime_masters_bytes = None
+            tally_excluded = []
             write_log(
                 job_id,
-                f"Excluded from Tally files (total_value <= 0): "
-                f"{x['party_name'] or 'Unknown vendor'} / {x['invoice_no'] or 'N/A'} = {x['total_value']:.2f}"
+                f"WARNING: Tally file generation failed — sending Excel-only "
+                f"email instead:\n{tally_generation_error}"
             )
+            errors.append(f"Tally file generation failed: {tally_generation_error}")
 
         email_ok, email_result = send_email(
             excel_bytes       = excel_bytes,
@@ -823,6 +848,7 @@ def retrieve_results(
             tally_prime_bytes = tally_prime_bytes,
             tally_erp9_masters_bytes  = tally_erp9_masters_bytes,
             tally_prime_masters_bytes = tally_prime_masters_bytes,
+            tally_generation_error    = tally_generation_error,
         )
         write_log(
             job_id,

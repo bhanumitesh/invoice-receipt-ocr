@@ -1607,6 +1607,7 @@ def send_email(
     tally_erp9_masters_bytes:  bytes = None,
     tally_prime_masters_bytes: bytes = None,
     tally_excluded:    list  = None,
+    tally_generation_error: str = None,
 ) -> tuple:
     """
     Sends Excel + both Tally XML files as email attachments via Resend API.
@@ -1658,6 +1659,15 @@ def send_email(
             + "\n"
         )
 
+    tally_error_section = ""
+    if tally_generation_error:
+        tally_error_section = (
+            "\n-- Tally File Generation Failed --\n"
+            "Tally XML files could not be generated this run — only the\n"
+            "Excel register is attached. Please retry, or contact support\n"
+            "if this persists.\n"
+        )
+
     body = (
         f"Hi,\n\n"
         f"Your invoice extraction is complete.\n\n"
@@ -1671,6 +1681,7 @@ def send_email(
         + upload_dup_section
         + dup_section
         + tally_excluded_section
+        + tally_error_section
         + f"\n-- Note --\n"
         f"Attachments:\n"
         f"  Invoice_Register.xlsx        — full register for review\n"

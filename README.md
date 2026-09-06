@@ -112,6 +112,18 @@ streamlit run app.py
 ```
 Opens at http://localhost:8501
 
+### 6. Run the tests
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+Covers the Tally XML generation (`tests/test_tally_xml.py`) — vendor-name
+canonicalization, `REMOTEID`/`GUID` uniqueness, bill-wise allocation,
+GST/no-GST voucher structure — and the Excel/email resilience fix
+(`tests/test_retrieve_results_resilience.py`) that keeps a bug in Tally file
+generation from blocking the results email. `requirements-dev.txt` is
+separate from `requirements.txt` since `pytest` isn't needed in production.
+
 ---
 
 ## How to Use
