@@ -941,6 +941,11 @@ if process_requested and not is_batch:
             with st.expander("📧 Also send via email?"):
                 if st.button(f"Send to {user_email}"):
                     with st.spinner("Sending..."):
+                        source_files = [
+                            {"filename": f.name, "content": f.getvalue()}
+                            for f in processing_files
+                            if hasattr(f, "getvalue")
+                        ]
                         ok, msg = send_email(
                             excel_bytes       = excel_bytes,
                             cost              = None,
@@ -952,6 +957,7 @@ if process_requested and not is_batch:
                             upload_dup_warnings = duplicate_upload_warnings or None,
                             tally_erp9_bytes  = tally_erp9_bytes,
                             tally_prime_bytes = tally_prime_bytes,
+                            source_files      = source_files or None,
                         )
                     if ok:
                         st.success(f"✅ Sent to {user_email}")

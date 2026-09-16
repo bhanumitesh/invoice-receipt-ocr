@@ -34,6 +34,7 @@
 
 import json
 import re
+import shutil
 import threading
 import time
 import traceback
@@ -124,6 +125,56 @@ def cleanup_batch_files(job_id: str):
                 path.unlink()
         except Exception:
             pass
+    try:
+        src_dir = _sources_dir(job_id)
+        if src_dir.exists():
+            shutil.rmtree(src_dir, ignore_errors=True)
+    except Exception:
+        pass
+
+
+# ── Original source-file persistence (for email attachments) ───────────────────
+#
+#  submit_batch() and retrieve_results() run in separate background threads,
+#  potentially minutes to hours apart (Batch API turnaround) — by retrieval
+#  time the in-memory Streamlit UploadedFile handed to submit_batch is long
+#  gone. To attach the original uploaded file(s) to the completion email
+#  anyway, submit_batch() saves each one's raw bytes here, keyed by job_id,
+#  and retrieve_results() reads them back. Camera-captured sources (dicts
+#  with "images") have no single original file and are skipped — there's
+#  nothing to attach for those.
+
+def _sources_dir(job_id: str) -> Path: return LOG_DIR / f"{job_id}_sources"
+
+
+def _save_source_files(job_id: str, sources: list):
+    src_dir = _sources_dir(job_id)
+    for idx, source in enumerate(sources):
+        if isinstance(source, dict) and "images" in source:
+            continue
+        try:
+            name    = Path(source.name).name
+            content = source.getvalue()
+        except Exception:
+            continue
+        src_dir.mkdir(exist_ok=True)
+        with open(src_dir / f"{idx:03d}_{name}", "wb") as f:
+            f.write(content)
+
+
+def _load_source_files(job_id: str) -> list:
+    src_dir = _sources_dir(job_id)
+    if not src_dir.exists():
+        return []
+    files = []
+    for path in sorted(src_dir.iterdir()):
+        try:
+            # Strip the "NNN_" ordering prefix added by _save_source_files.
+            filename = path.name.split("_", 1)[1] if "_" in path.name else path.name
+            files.append({"filename": filename, "content": path.read_bytes()})
+        except Exception:
+            pass
+    return files
 
 
 # ── Submission status file helpers ─────────────────────────────────────────────
@@ -233,6 +284,12 @@ def submit_batch(sources: list, user_email: str = None, job_id: str = None) -> d
     def log(msg):
         if job_id:
             write_log(job_id, msg)
+
+    if job_id:
+        try:
+            _save_source_files(job_id, sources)
+        except Exception:
+            log(f"WARNING: failed to persist source file(s) for email attachment:\n{traceback.format_exc()}")
 
     try:
         ts               = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -832,6 +889,8 @@ def retrieve_results(
             )
             errors.append(f"Tally file generation failed: {tally_generation_error}")
 
+        source_files = _load_source_files(job_id)
+
         email_ok, email_result = send_email(
             excel_bytes       = excel_bytes,
             cost              = batch_cost,
@@ -849,6 +908,7 @@ def retrieve_results(
             tally_erp9_masters_bytes  = tally_erp9_masters_bytes,
             tally_prime_masters_bytes = tally_prime_masters_bytes,
             tally_generation_error    = tally_generation_error,
+            source_files      = source_files or None,
         )
         write_log(
             job_id,

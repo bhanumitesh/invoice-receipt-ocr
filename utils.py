@@ -1591,6 +1591,12 @@ def create_tally_ledger_masters_xml(items: list, tally_version: str) -> bytes:
 
 # ── Email ─────────────────────────────────────────────────────────────────────
 
+# Resend caps the total request payload around 40MB; base64 inflates raw
+# bytes by ~33%, so this is the raw (pre-base64) budget across every
+# attachment combined — leaves headroom rather than cutting it exactly at 40MB.
+MAX_EMAIL_ATTACHMENT_BYTES = 28 * 1024 * 1024
+
+
 def send_email(
     excel_bytes:       bytes,
     cost:              dict,
@@ -1608,6 +1614,7 @@ def send_email(
     tally_prime_masters_bytes: bytes = None,
     tally_excluded:    list  = None,
     tally_generation_error: str = None,
+    source_files:      list  = None,
 ) -> tuple:
     """
     Sends Excel + both Tally XML files as email attachments via Resend API.
@@ -1615,6 +1622,12 @@ def send_email(
       - user_email  : the logged-in user who triggered the job (always included)
       - ADMIN_EMAIL : admin address(es) from config (always included)
     Uses HTTPS (port 443) — works on all hosting platforms including Render free tier.
+
+    source_files: optional list of {"filename": str, "content": bytes} for the
+    original uploaded file(s) that were processed — attached alongside the
+    Excel/Tally output for reference. Omitted (with a note in the body) if
+    attaching them would push the email over Resend's size limit.
+
     Returns (success: bool, message: str)
     """
     resend.api_key = config.RESEND_API_KEY
@@ -1668,6 +1681,30 @@ def send_email(
             "if this persists.\n"
         )
 
+    # Decide up front whether the original file(s) fit in the size budget
+    # alongside the Excel/Tally attachments — those are the actual
+    # deliverable, so if anything gets dropped for size it's the source
+    # files, not them.
+    source_files = source_files or []
+    core_bytes = (
+        len(excel_bytes)
+        + len(tally_erp9_bytes or b"")
+        + len(tally_prime_bytes or b"")
+        + len(tally_erp9_masters_bytes or b"")
+        + len(tally_prime_masters_bytes or b"")
+    )
+    source_bytes = sum(len(sf["content"]) for sf in source_files)
+    source_files_omitted = bool(source_files) and (core_bytes + source_bytes) > MAX_EMAIL_ATTACHMENT_BYTES
+    attach_source_files  = [] if source_files_omitted else source_files
+
+    source_omitted_section = ""
+    if source_files_omitted:
+        source_omitted_section = (
+            "\n-- Original File(s) Not Attached --\n"
+            "The uploaded source file(s) were too large to include alongside\n"
+            "the Excel/Tally attachments and were left out of this email.\n"
+        )
+
     body = (
         f"Hi,\n\n"
         f"Your invoice extraction is complete.\n\n"
@@ -1682,6 +1719,7 @@ def send_email(
         + dup_section
         + tally_excluded_section
         + tally_error_section
+        + source_omitted_section
         + f"\n-- Note --\n"
         f"Attachments:\n"
         f"  Invoice_Register.xlsx        — full register for review\n"
@@ -1696,6 +1734,10 @@ def send_email(
             "    1. Tally_Prime_LedgerMasters.xml — creates any missing ledgers\n"
             "    2. Tally_Prime_Import.xml        — the actual entries\n"
             if tally_prime_bytes else ""
+        )
+        + (
+            "\n  Original uploaded file(s) — attached for reference\n"
+            if attach_source_files else ""
         )
         + f"\nAll values extracted directly from source documents.\n"
         f"Default expense ledger used: {config.TALLY_DEFAULT_LEDGER}\n"
@@ -1735,6 +1777,12 @@ def send_email(
         attachments.append({
             "filename": f"Tally_Prime_Import_{ts}.xml",
             "content":  base64.b64encode(tally_prime_bytes).decode("utf-8"),
+        })
+
+    for sf in attach_source_files:
+        attachments.append({
+            "filename": sf["filename"],
+            "content":  base64.b64encode(sf["content"]).decode("utf-8"),
         })
 
     try:
